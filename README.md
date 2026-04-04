@@ -35,6 +35,7 @@ This repository is derived from ideas and structures explored in:
 
 - `gstack`: https://github.com/garrytan/gstack
 - `everything-claude-code`: https://github.com/affaan-m/everything-claude-code
+- `claude-code-best-practice`: a local reference knowledge base used to refine host guidance, skill authoring rules, and runtime patterns
 
 These are references and inspirations, not bundled runtime dependencies.
 
@@ -51,6 +52,18 @@ These are references and inspirations, not bundled runtime dependencies.
 - `docs/`: architecture, spec, plan, and security review
 
 Generated host payloads are committed so fresh checkouts retain local skill discovery in Codex and Claude. When `skills/` changes, regenerate `.agents/skills/` and `.claude/skills/` before committing. Install-output directories such as `.claude/plugins/` and `.super-skills/` remain untracked.
+
+## Authoring Contract
+
+Source skills remain host-neutral and live only in `skills/`.
+
+- allowed source frontmatter keys are `name`, `description`, and `origin`
+- `name` must match the directory name
+- `description` should read like a routing trigger, usually `Use when ...` or `Use for ...`
+- host-specific metadata such as `allowed-tools`, `model`, `context`, `agent`, and `hooks` is intentionally blocked from source skills
+- `Gotchas` sections are recommended for high-signal model failure modes
+
+See [SKILL-AUTHORING.md](/Volumes/Storage/src/super-skills/docs/SKILL-AUTHORING.md) and [HOST-COMPATIBILITY.md](/Volumes/Storage/src/super-skills/docs/HOST-COMPATIBILITY.md).
 
 ## Core Skills
 
@@ -325,6 +338,8 @@ skills/my-skill/
 
 Each `SKILL.md` should include the required frontmatter used by the generators and validators.
 
+Source skills are intentionally host-neutral. Do not copy Claude-only command, hook, or subagent frontmatter into `skills/`.
+
 Then run:
 
 ```bash
@@ -369,6 +384,10 @@ Security defaults are conservative:
 - Spec: [SPEC.md](/Volumes/Storage/src/super-skills/docs/SPEC.md)
 - Plan: [PLAN.md](/Volumes/Storage/src/super-skills/docs/PLAN.md)
 - Architecture: [ARCHITECTURE.md](/Volumes/Storage/src/super-skills/docs/ARCHITECTURE.md)
+- Skill authoring: [SKILL-AUTHORING.md](/Volumes/Storage/src/super-skills/docs/SKILL-AUTHORING.md)
+- Host compatibility: [HOST-COMPATIBILITY.md](/Volumes/Storage/src/super-skills/docs/HOST-COMPATIBILITY.md)
+- Agent patterns: [AGENT-PATTERNS.md](/Volumes/Storage/src/super-skills/docs/AGENT-PATTERNS.md)
+- Runtime guidance: [RUNTIME-GUIDANCE.md](/Volumes/Storage/src/super-skills/docs/RUNTIME-GUIDANCE.md)
 - Security review: [SECURITY-REVIEW.md](/Volumes/Storage/src/super-skills/docs/SECURITY-REVIEW.md)
 
 ## License

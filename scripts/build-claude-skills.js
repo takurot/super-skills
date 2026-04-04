@@ -2,6 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { extractFrontmatter, validateSourceSkillMetadata } = require("./lib/skill-metadata");
 
 const ROOT = path.resolve(__dirname, "..");
 const SKILLS_DIR = path.join(ROOT, "skills");
@@ -43,6 +44,19 @@ function main() {
     .sort();
 
   for (const skillName of skillDirs) {
+    const sourceSkill = path.join(SKILLS_DIR, skillName, "SKILL.md");
+    const content = fs.readFileSync(sourceSkill, "utf8");
+    const { data } = extractFrontmatter(content);
+    const { errors, warnings } = validateSourceSkillMetadata({
+      dirName: skillName,
+      data,
+    });
+    if (errors.length > 0) {
+      throw new Error(errors.join("\n"));
+    }
+    for (const warning of warnings) {
+      console.warn(`WARN: ${warning}`);
+    }
     copyRecursive(path.join(SKILLS_DIR, skillName), path.join(CLAUDE_SKILLS_DIR, skillName));
   }
 

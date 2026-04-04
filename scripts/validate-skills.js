@@ -2,27 +2,10 @@
 
 const fs = require("fs");
 const path = require("path");
+const { extractFrontmatter, validateSourceSkillMetadata } = require("./lib/skill-metadata");
 
 const ROOT = path.resolve(__dirname, "..");
 const SKILLS_DIR = path.join(ROOT, "skills");
-
-function parseFrontmatter(content) {
-  if (!content.startsWith("---\n")) return null;
-  const end = content.indexOf("\n---\n", 4);
-  if (end === -1) return null;
-  const raw = content.slice(4, end);
-  const result = {};
-
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    const match = line.match(/^([A-Za-z0-9_-]+):\s*(.+)$/);
-    if (match) {
-      result[match[1]] = match[2].trim();
-    }
-  }
-
-  return result;
-}
 
 function main() {
   if (!fs.existsSync(SKILLS_DIR)) {
@@ -42,21 +25,25 @@ function main() {
     }
 
     const content = fs.readFileSync(skillFile, "utf8");
-    const frontmatter = parseFrontmatter(content);
-    if (!frontmatter) {
+    let frontmatter;
+    try {
+      ({ data: frontmatter } = extractFrontmatter(content));
+    } catch (error) {
       console.error(`ERROR: skills/${entry.name}/SKILL.md has invalid frontmatter`);
       errors += 1;
       continue;
     }
 
-    if (!frontmatter.name) {
-      console.error(`ERROR: skills/${entry.name}/SKILL.md missing name`);
+    const result = validateSourceSkillMetadata({
+      dirName: entry.name,
+      data: frontmatter,
+    });
+    for (const message of result.errors) {
+      console.error(`ERROR: ${message}`);
       errors += 1;
     }
-
-    if (!content.includes("description: |") && !frontmatter.description) {
-      console.error(`ERROR: skills/${entry.name}/SKILL.md missing description`);
-      errors += 1;
+    for (const message of result.warnings) {
+      console.warn(`WARN: ${message}`);
     }
 
     const logicalName = frontmatter.name || entry.name;

@@ -27,6 +27,8 @@ Codex-facing generated skill artifacts live in:
 
 If both exist, treat `skills/` as authored source and `.agents/skills/` as generated output.
 
+Source skills are host-neutral. Do not add host-specific frontmatter to `skills/`; keep runtime-specific behavior in generated metadata, `.codex/`, or host adapters.
+
 ## Current Core Skill Direction
 
 The repository is organized around a small core workflow set first:
@@ -82,3 +84,9 @@ These roles are meant to support worktree-based parallel execution without overl
 - Keep defaults safe and minimal
 - Prefer deterministic scripts over hidden side effects
 - Do not normalize telemetry, auto-approval, or auto-upgrade as default behavior
+
+See also:
+
+- [SKILL-AUTHORING.md](/Volumes/Storage/src/super-skills/docs/SKILL-AUTHORING.md)
+- [AGENT-PATTERNS.md](/Volumes/Storage/src/super-skills/docs/AGENT-PATTERNS.md)
+- [RUNTIME-GUIDANCE.md](/Volumes/Storage/src/super-skills/docs/RUNTIME-GUIDANCE.md)

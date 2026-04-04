@@ -2,6 +2,11 @@
 
 const fs = require("fs");
 const path = require("path");
+const {
+  extractFrontmatter,
+  normalizeDescription,
+  validateSourceSkillMetadata,
+} = require("./lib/skill-metadata");
 
 const ROOT = path.resolve(__dirname, "..");
 const SKILLS_DIR = path.join(ROOT, "skills");
@@ -12,50 +17,6 @@ function readDirSafe(dir) {
   return fs.readdirSync(dir, { withFileTypes: true });
 }
 
-function extractFrontmatter(content) {
-  if (!content.startsWith("---\n")) {
-    throw new Error("missing frontmatter");
-  }
-
-  const end = content.indexOf("\n---\n", 4);
-  if (end === -1) {
-    throw new Error("unterminated frontmatter");
-  }
-
-  const raw = content.slice(4, end);
-  const body = content.slice(end + 5);
-  const lines = raw.split("\n");
-  const data = {};
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    if (!line.trim()) continue;
-
-    const blockMatch = line.match(/^([A-Za-z0-9_-]+):\s*\|\s*$/);
-    if (blockMatch) {
-      const key = blockMatch[1];
-      const block = [];
-      for (i += 1; i < lines.length; i += 1) {
-        const next = lines[i];
-        if (/^\S/.test(next)) {
-          i -= 1;
-          break;
-        }
-        block.push(next.replace(/^  /, ""));
-      }
-      data[key] = block.join("\n").trim();
-      continue;
-    }
-
-    const inlineMatch = line.match(/^([A-Za-z0-9_-]+):\s*(.+?)\s*$/);
-    if (inlineMatch) {
-      data[inlineMatch[1]] = inlineMatch[2];
-    }
-  }
-
-  return { data, body };
-}
-
 function sentenceCaseToDisplayName(value) {
   return value
     .split("-")
@@ -64,7 +25,7 @@ function sentenceCaseToDisplayName(value) {
 }
 
 function shortDescription(description) {
-  const collapsed = description.replace(/\s+/g, " ").trim();
+  const collapsed = normalizeDescription(description);
   if (collapsed.length <= 120) return collapsed;
   const slice = collapsed.slice(0, 117);
   const lastSpace = slice.lastIndexOf(" ");
@@ -105,9 +66,17 @@ function main() {
 
     const source = fs.readFileSync(skillPath, "utf8");
     const { data } = extractFrontmatter(source);
+    const { errors, warnings } = validateSourceSkillMetadata({
+      dirName,
+      data,
+    });
 
-    if (!data.name || !data.description) {
-      throw new Error(`skills/${dirName}/SKILL.md must declare name and description`);
+    if (errors.length > 0) {
+      throw new Error(errors.join("\n"));
+    }
+
+    for (const warning of warnings) {
+      console.warn(`WARN: ${warning}`);
     }
 
     const outDir = path.join(AGENTS_SKILLS_DIR, dirName);
@@ -122,4 +91,3 @@ function main() {
 }
 
 main();
-

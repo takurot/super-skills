@@ -10,6 +10,8 @@ Super Skills separates authored workflow content from generated harness-specific
 
 `skills/<name>/SKILL.md` is the canonical source for each skill. These files are written for humans first and keep workflow semantics in one place.
 
+Source skills stay host-neutral. Host-specific runtime metadata is not authored in `skills/`.
+
 ### 2. Generated Codex artifacts
 
 `.agents/skills/<name>/` is generated from `skills/`. It mirrors the skill content and adds `agents/openai.yaml` metadata for Codex discovery. These generated artifacts are committed as a repository-local baseline so fresh checkouts preserve Codex skill discovery.
@@ -47,6 +49,13 @@ Required frontmatter keys in `SKILL.md`:
 - `description`
 - `origin`
 
+Additional contract rules:
+
+- `name` matches the directory name
+- `description` is trigger-oriented rather than summary-oriented
+- host-specific frontmatter belongs in generated artifacts or adapters, not source skills
+- `Gotchas` sections are recommended for learned failure modes
+
 ## Security model
 
 Default behavior is conservative:
@@ -65,3 +74,10 @@ Default behavior is conservative:
 4. Run `node scripts/build-claude-skills.js`
 5. Generated Claude skill copies appear in `.claude/skills/<name>/`
 6. Run `node scripts/validate-skills.js`
+
+Related docs:
+
+- [SKILL-AUTHORING.md](/Volumes/Storage/src/super-skills/docs/SKILL-AUTHORING.md)
+- [HOST-COMPATIBILITY.md](/Volumes/Storage/src/super-skills/docs/HOST-COMPATIBILITY.md)
+- [AGENT-PATTERNS.md](/Volumes/Storage/src/super-skills/docs/AGENT-PATTERNS.md)
+- [RUNTIME-GUIDANCE.md](/Volumes/Storage/src/super-skills/docs/RUNTIME-GUIDANCE.md)
