@@ -604,3 +604,110 @@ The unified repository is successful when:
 - Plugin adapters are opt-in
 - Security defaults are safer than both source repos
 - The repo supports phased expansion without restructuring
+
+## Skill Build Pipeline Enhancements (v1.1)
+
+The core skill generation pipeline exists but requires the following additions to be complete.
+
+### Claude Frontmatter Injection
+
+`scripts/build-claude-skills.js` currently copies `SKILL.md` verbatim from `skills/` into `.claude/skills/`.
+Claude Code requires `user-invocable: true` in the frontmatter to surface a skill as an invocable slash command.
+Because source skills must remain host-neutral (enforced by `validateSourceSkillMetadata`), this field must be
+injected during the Claude-facing build step.
+
+Requirements:
+
+- After extracting frontmatter from the source skill, inject `user-invocable: true` before writing to `.claude/skills/<name>/SKILL.md`
+- The injection must be applied to every skill directory processed by `build-claude-skills.js`
+- The build must still fail if the source skill already declares any host-specific frontmatter key (existing rule preserved)
+- A helper function `injectClaudeFrontmatter(content)` must be extracted into `scripts/lib/skill-metadata.js` and covered by unit tests
+
+### Drift Detection
+
+After a skill is edited in `skills/`, the generated artifacts in `.agents/skills/` and `.claude/skills/` may become
+stale without any visible signal. The `check` script currently rebuilds everything but does not detect whether
+previously generated artifacts have drifted from their source.
+
+Because the two generators apply different transformations, drift must be detected differently per target:
+
+- `build-skills.js` copies `SKILL.md` verbatim into `.agents/skills/<name>/SKILL.md`. Drift is detected by
+  comparing the SHA-256 of the source file against the SHA-256 of the corresponding `.agents/` file directly.
+- `build-claude-skills.js` injects `user-invocable: true` before writing to `.claude/skills/<name>/SKILL.md`,
+  so the generated content intentionally differs from the source. Drift must be detected by rendering the
+  expected output in memory using the same `injectClaudeFrontmatter` logic and comparing that rendered
+  result against the file on disk. The source file content is NOT compared verbatim against the Claude target file.
+- `build-skills.js` also writes `agents/openai.yaml` derived from skill metadata, not copied from source.
+  Drift for this file is detected by regenerating the expected YAML string from the source frontmatter using
+  the same `buildOpenAIYaml` logic and comparing against the file on disk.
+
+A new script `scripts/check-drift.js` must:
+
+- For each skill directory in `skills/`:
+  - Check `.agents/skills/<name>/SKILL.md` via direct content hash comparison (verbatim copy)
+  - Check `.agents/skills/<name>/agents/openai.yaml` via regenerated expected content comparison
+  - Check `.claude/skills/<name>/SKILL.md` via rendered-in-memory expected content comparison
+  - Report each drifted or missing artifact by name and artifact path
+- Support `--json` output mode
+- Exit with code 0 when no drift is found, code 1 when drift is detected
+- Be invoked at the start of the `check` npm script so drift is caught before build runs
+
+The script must not write any files. It is a read-only consistency check.
+
+## Installer Enhancements (v1.1)
+
+The installer pipeline (`install-plan.mjs`, `install-apply.mjs`, `install-lib.mjs`) is implemented and functional.
+The following additions are required to support safe re-installation and operational visibility.
+
+### Force Override Flag
+
+`install-apply.mjs` refuses to overwrite authored files that have been locally modified, which is correct default
+behavior. However, there is no escape hatch for re-installation or upgrade scenarios.
+
+A `--force` flag must be added that:
+
+- Allows `copyFileSafely` to overwrite authored files even when content differs
+- Does not change behavior for generated files (always overwritten regardless of `--force`)
+- Is parsed in `install-lib.mjs > parseArgs` and forwarded to apply operations
+- Is surfaced in dry-run output when active: `Force mode: authored file overwrites enabled`
+
+### Install Status Command
+
+There is no command to verify the health of an existing install without re-running the full apply.
+
+A new script `scripts/install-status.mjs` must:
+
+- Accept `--target <codex|claude>`, `--target-root <path>`, and `--json` flags
+- Read the state file written by `install-apply.mjs` at `.super-skills/install-state/<target>.json`
+- Report `NOT INSTALLED` if the state file does not exist
+- Expand each recorded module operation from `state.pendingOperations` into concrete expected file paths,
+  then verify that each expanded path exists under `targetRoot`. This is required because `state.targetPaths`
+  records only top-level directories (e.g. `.claude/skills`), which may exist even when their contents are
+  missing or incomplete. Using `pendingOperations` to expand to actual expected files provides a more
+  accurate health signal.
+- Exit with code 0 when all expanded paths exist, code 1 when any are missing
+- Avoid content hash comparison in v1.1 (path presence check is sufficient for this iteration)
+
+Note: if `state.pendingOperations` does not provide sufficient resolution to enumerate individual files
+(e.g. for directory-copy operations), the script may fall back to checking that each `targetPath` entry
+is a non-empty directory rather than just checking existence.
+
+### Convenience Entry Points
+
+Users must know to run `node scripts/install-apply.mjs` with explicit flags, which requires knowledge of the
+repository internals. The following npm scripts must be added to `package.json` to expose the most common operations:
+
+- `install:claude` — applies `developer` profile to `--target-root ~`
+- `install:codex` — applies `developer` profile to `--target-root ~`
+- `install:plan:claude` — dry-run plan for `developer` profile against Claude target
+- `install:plan:codex` — dry-run plan for `developer` profile against Codex target
+- `install:status:claude` — runs `install-status.mjs --target claude` against `--target-root ~`
+- `install:status:codex` — runs `install-status.mjs --target codex` against `--target-root ~`
+
+These scripts do not replace the low-level CLI; they are aliases for the most common invocations.
+
+### Non-Goals For Installer v1.1
+
+- `--upgrade` and `--repair` modes (require drift detection per-file; deferred to v1.2)
+- Content hash comparison in `install-status.mjs` (deferred to v1.2)
+- `npx super-skills` entrypoint (local clone assumed for v1)
