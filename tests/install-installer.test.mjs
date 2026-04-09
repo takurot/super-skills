@@ -120,16 +120,60 @@ test("install-status reports installed, missing, and not installed states", () =
   assert.equal(statusJson.target, "claude");
   assert.equal(statusJson.profile, "developer");
   assert.ok(statusJson.ok.some((entry) => entry.path === ".claude/AGENTS.md"));
-  assert.ok(statusJson.ok.some((entry) => entry.path === ".claude/skills"));
+  assert.ok(statusJson.ok.some((entry) => entry.path === ".claude/skills/review/SKILL.md"));
   assert.deepEqual(statusJson.missing, []);
 
-  fs.rmSync(path.join(installedRoot, ".claude", "AGENTS.md"));
+  fs.rmSync(path.join(installedRoot, ".claude", "skills", "review", "SKILL.md"));
 
   result = runNode(statusScript, [
     "--target",
     "claude",
     "--target-root",
     installedRoot
+  ]);
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /MISSING\s+\.claude\/skills\/review\/SKILL\.md/);
+
+  const codexRoot = makeTempRoot();
+  result = runNode(applyScript, [
+    "--profile",
+    "developer",
+    "--target",
+    "codex",
+    "--target-root",
+    codexRoot
+  ]);
+  assert.equal(result.status, 0);
+
+  fs.rmSync(path.join(codexRoot, ".codex", "agents", "explorer.toml"));
+
+  result = runNode(statusScript, [
+    "--target",
+    "codex",
+    "--target-root",
+    codexRoot
+  ]);
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /MISSING\s+\.codex\/agents\/explorer\.toml/);
+
+  const authoredMissingRoot = makeTempRoot();
+  result = runNode(applyScript, [
+    "--profile",
+    "developer",
+    "--target",
+    "claude",
+    "--target-root",
+    authoredMissingRoot
+  ]);
+  assert.equal(result.status, 0);
+
+  fs.rmSync(path.join(authoredMissingRoot, ".claude", "AGENTS.md"));
+
+  result = runNode(statusScript, [
+    "--target",
+    "claude",
+    "--target-root",
+    authoredMissingRoot
   ]);
   assert.equal(result.status, 1);
   assert.match(result.stdout, /MISSING\s+\.claude\/AGENTS\.md/);

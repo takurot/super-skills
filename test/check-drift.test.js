@@ -38,9 +38,9 @@ test("collectDrift reports no drift for matching artifacts", () => {
 
   const report = collectDrift(root);
 
-  assert.equal(report.ok, true);
-  assert.equal(report.drift.length, 0);
-  assert.match(formatDriftReport(report), /No drift detected/);
+  assert.deepEqual(report.drifted, []);
+  assert.deepEqual(report.ok, ["demo"]);
+  assert.equal(formatDriftReport(report), "OK     demo");
 });
 
 test("collectDrift reports Claude drift and JSON output", () => {
@@ -55,11 +55,12 @@ test("collectDrift reports Claude drift and JSON output", () => {
   const report = collectDrift(root);
   const json = JSON.parse(formatDriftReport(report, { json: true }));
 
-  assert.equal(report.ok, false);
-  assert.equal(json.ok, false);
-  assert.equal(json.drift.length, 1);
-  assert.match(json.drift[0].targetPath, /\.claude\/skills\/demo\/SKILL\.md$/);
-  assert.match(json.drift[0].message, /Claude/i);
+  assert.deepEqual(report.ok, []);
+  assert.equal(json.ok.length, 0);
+  assert.equal(json.drifted.length, 1);
+  assert.equal(json.drifted[0].skill, "demo");
+  assert.equal(json.drifted[0].artifact, ".claude/skills/demo/SKILL.md");
+  assert.equal(json.drifted[0].reason, "stale");
 });
 
 test("collectDrift reports OpenAI YAML drift in text output", () => {
@@ -77,7 +78,6 @@ test("collectDrift reports OpenAI YAML drift in text output", () => {
   const report = collectDrift(root);
   const text = formatDriftReport(report);
 
-  assert.equal(report.ok, false);
-  assert.match(text, /Drift detected/);
-  assert.match(text, /\.agents\/skills\/demo\/agents\/openai\.yaml/);
+  assert.deepEqual(report.ok, []);
+  assert.match(text, /^DRIFT\s+demo\s+\.agents\/skills\/demo\/agents\/openai\.yaml \(stale\)$/);
 });

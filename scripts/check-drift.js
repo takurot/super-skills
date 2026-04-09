@@ -47,33 +47,27 @@ function readText(filePath) {
   return fs.readFileSync(filePath, "utf8");
 }
 
-function compareFile(drift, targetPath, expected, skillName, label) {
+function makeDriftEntry(rootDir, skillName, targetPath, reason) {
+  return {
+    skill: skillName,
+    artifact: path.relative(rootDir, targetPath),
+    reason,
+  };
+}
+
+function compareFile(drifted, rootDir, targetPath, expected, skillName) {
   if (!fs.existsSync(targetPath)) {
-    drift.push({
-      kind: "missing",
-      label,
-      skill: skillName,
-      targetPath,
-      message: `${label} is missing`,
-    });
+    drifted.push(makeDriftEntry(rootDir, skillName, targetPath, "missing"));
     return;
   }
 
   const actualText = readText(targetPath);
   if (actualText !== expected) {
-    drift.push({
-      kind: "mismatch",
-      label,
-      skill: skillName,
-      targetPath,
-      message: `${label} content drift`,
-      expected,
-      actual: actualText,
-    });
+    drifted.push(makeDriftEntry(rootDir, skillName, targetPath, "stale"));
   }
 }
 
-function compareAgentsPackage(rootDir, skillName, sourceContent, sourceData, drift) {
+function compareAgentsPackage(rootDir, skillName, sourceContent, sourceData, drifted) {
   const packageRoot = path.join(rootDir, ".agents", "skills", skillName);
   const expectedFiles = new Map([
     [path.join(packageRoot, "SKILL.md"), sourceContent],
@@ -81,24 +75,18 @@ function compareAgentsPackage(rootDir, skillName, sourceContent, sourceData, dri
   ]);
 
   for (const [targetPath, expected] of expectedFiles) {
-    compareFile(drift, targetPath, expected, skillName, path.relative(rootDir, targetPath));
+    compareFile(drifted, rootDir, targetPath, expected, skillName);
   }
 
   for (const relativePath of readFilesRecursive(packageRoot)) {
     if (relativePath === "SKILL.md" || relativePath === path.join("agents", "openai.yaml")) {
       continue;
     }
-    drift.push({
-      kind: "unexpected",
-      label: ".agents",
-      skill: skillName,
-      targetPath: path.join(packageRoot, relativePath),
-      message: `unexpected generated file '${path.join(".agents/skills", skillName, relativePath)}'`,
-    });
+    drifted.push(makeDriftEntry(rootDir, skillName, path.join(packageRoot, relativePath), "unexpected"));
   }
 }
 
-function compareClaudePackage(rootDir, skillName, sourceContent, drift) {
+function compareClaudePackage(rootDir, skillName, sourceContent, drifted) {
   const sourceRoot = path.join(rootDir, "skills", skillName);
   const packageRoot = path.join(rootDir, ".claude", "skills", skillName);
   const expectedFiles = new Map();
@@ -111,20 +99,14 @@ function compareClaudePackage(rootDir, skillName, sourceContent, drift) {
   }
 
   for (const [targetPath, expected] of expectedFiles) {
-    compareFile(drift, targetPath, expected, skillName, path.relative(rootDir, targetPath));
+    compareFile(drifted, rootDir, targetPath, expected, skillName);
   }
 
   for (const relativePath of readFilesRecursive(packageRoot)) {
     if (expectedFiles.has(path.join(packageRoot, relativePath))) {
       continue;
     }
-    drift.push({
-      kind: "unexpected",
-      label: ".claude",
-      skill: skillName,
-      targetPath: path.join(packageRoot, relativePath),
-      message: `unexpected generated file '${path.join(".claude/skills", skillName, relativePath)}'`,
-    });
+    drifted.push(makeDriftEntry(rootDir, skillName, path.join(packageRoot, relativePath), "unexpected"));
   }
 }
 
@@ -132,7 +114,8 @@ function collectDrift(rootDir = ROOT) {
   const skillsDir = path.join(rootDir, "skills");
   const agentsSkillsDir = path.join(rootDir, ".agents", "skills");
   const claudeSkillsDir = path.join(rootDir, ".claude", "skills");
-  const drift = [];
+  const drifted = [];
+  const ok = [];
 
   const sourceSkills = readDirNames(skillsDir);
   const agentSkills = readDirNames(agentsSkillsDir);
@@ -140,38 +123,21 @@ function collectDrift(rootDir = ROOT) {
 
   for (const skillName of agentSkills) {
     if (!sourceSkills.includes(skillName)) {
-      drift.push({
-        kind: "unexpected",
-        label: ".agents",
-        skill: skillName,
-        targetPath: path.join(agentsSkillsDir, skillName),
-        message: `unexpected generated skill '.agents/skills/${skillName}'`,
-      });
+      drifted.push(makeDriftEntry(rootDir, skillName, path.join(agentsSkillsDir, skillName), "unexpected"));
     }
   }
 
   for (const skillName of claudeSkills) {
     if (!sourceSkills.includes(skillName)) {
-      drift.push({
-        kind: "unexpected",
-        label: ".claude",
-        skill: skillName,
-        targetPath: path.join(claudeSkillsDir, skillName),
-        message: `unexpected generated skill '.claude/skills/${skillName}'`,
-      });
+      drifted.push(makeDriftEntry(rootDir, skillName, path.join(claudeSkillsDir, skillName), "unexpected"));
     }
   }
 
   for (const skillName of sourceSkills) {
     const sourcePath = path.join(skillsDir, skillName, "SKILL.md");
+    const driftCountBefore = drifted.length;
     if (!fs.existsSync(sourcePath)) {
-      drift.push({
-        kind: "missing",
-        label: "source",
-        skill: skillName,
-        targetPath: sourcePath,
-        message: `source skill '${skillName}' is missing SKILL.md`,
-      });
+      drifted.push(makeDriftEntry(rootDir, skillName, sourcePath, "missing"));
       continue;
     }
 
@@ -180,13 +146,7 @@ function collectDrift(rootDir = ROOT) {
     try {
       ({ data: sourceFrontmatter } = extractFrontmatter(sourceContent));
     } catch (error) {
-      drift.push({
-        kind: "invalid-source",
-        label: "source",
-        skill: skillName,
-        targetPath: sourcePath,
-        message: error.message,
-      });
+      drifted.push(makeDriftEntry(rootDir, skillName, sourcePath, "invalid"));
       continue;
     }
 
@@ -195,31 +155,22 @@ function collectDrift(rootDir = ROOT) {
       data: sourceFrontmatter,
     });
     if (validation.errors.length > 0) {
-      for (const message of validation.errors) {
-        drift.push({
-          kind: "invalid-source",
-          label: "source",
-          skill: skillName,
-          targetPath: sourcePath,
-          message,
-        });
+      for (const _message of validation.errors) {
+        drifted.push(makeDriftEntry(rootDir, skillName, sourcePath, "invalid"));
       }
       continue;
     }
 
-    compareClaudePackage(rootDir, skillName, sourceContent, drift);
-    compareAgentsPackage(rootDir, skillName, sourceContent, sourceFrontmatter, drift);
+    compareClaudePackage(rootDir, skillName, sourceContent, drifted);
+    compareAgentsPackage(rootDir, skillName, sourceContent, sourceFrontmatter, drifted);
+    if (drifted.length === driftCountBefore) {
+      ok.push(skillName);
+    }
   }
 
   return {
-    ok: drift.length === 0,
-    summary: {
-      sourceSkills: sourceSkills.length,
-      agentsSkills: agentSkills.length,
-      claudeSkills: claudeSkills.length,
-      driftCount: drift.length,
-    },
-    drift,
+    drifted,
+    ok,
   };
 }
 
@@ -228,14 +179,21 @@ function formatDriftReport(report, options = {}) {
     return JSON.stringify(report, null, 2);
   }
 
-  if (report.ok) {
-    return `No drift detected across ${report.summary.sourceSkills} source skill(s).`;
+  const skillNames = [...new Set([...report.drifted.map((entry) => entry.skill), ...report.ok])].sort();
+  const width = skillNames.reduce((max, skill) => Math.max(max, skill.length), 0);
+  const lines = [];
+
+  for (const skillName of skillNames) {
+    const entries = report.drifted.filter((entry) => entry.skill === skillName);
+    if (entries.length === 0) {
+      lines.push(`OK     ${skillName}`);
+      continue;
+    }
+    for (const entry of entries) {
+      lines.push(`DRIFT  ${skillName.padEnd(width)}   ${entry.artifact} (${entry.reason})`);
+    }
   }
 
-  const lines = [`Drift detected in ${report.summary.driftCount} place(s) across ${report.summary.sourceSkills} source skill(s).`];
-  for (const entry of report.drift) {
-    lines.push(`- ${path.relative(ROOT, entry.targetPath)}: ${entry.message}`);
-  }
   return lines.join("\n");
 }
 
@@ -250,7 +208,7 @@ function main(argv = process.argv.slice(2)) {
   const report = collectDrift(ROOT);
   const output = formatDriftReport(report, options);
   process.stdout.write(`${output}\n`);
-  process.exit(report.ok ? 0 : 1);
+  process.exit(report.drifted.length === 0 ? 0 : 1);
 }
 
 if (require.main === module) {
