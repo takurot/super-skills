@@ -629,11 +629,25 @@ After a skill is edited in `skills/`, the generated artifacts in `.agents/skills
 stale without any visible signal. The `check` script currently rebuilds everything but does not detect whether
 previously generated artifacts have drifted from their source.
 
+Because the two generators apply different transformations, drift must be detected differently per target:
+
+- `build-skills.js` copies `SKILL.md` verbatim into `.agents/skills/<name>/SKILL.md`. Drift is detected by
+  comparing the SHA-256 of the source file against the SHA-256 of the corresponding `.agents/` file directly.
+- `build-claude-skills.js` injects `user-invocable: true` before writing to `.claude/skills/<name>/SKILL.md`,
+  so the generated content intentionally differs from the source. Drift must be detected by rendering the
+  expected output in memory using the same `injectClaudeFrontmatter` logic and comparing that rendered
+  result against the file on disk. The source file content is NOT compared verbatim against the Claude target file.
+- `build-skills.js` also writes `agents/openai.yaml` derived from skill metadata, not copied from source.
+  Drift for this file is detected by regenerating the expected YAML string from the source frontmatter using
+  the same `buildOpenAIYaml` logic and comparing against the file on disk.
+
 A new script `scripts/check-drift.js` must:
 
-- Compute a content hash for each `skills/<name>/SKILL.md`
-- Compare against the corresponding `.agents/skills/<name>/SKILL.md` and `.claude/skills/<name>/SKILL.md`
-- Report each drifted or missing skill by name
+- For each skill directory in `skills/`:
+  - Check `.agents/skills/<name>/SKILL.md` via direct content hash comparison (verbatim copy)
+  - Check `.agents/skills/<name>/agents/openai.yaml` via regenerated expected content comparison
+  - Check `.claude/skills/<name>/SKILL.md` via rendered-in-memory expected content comparison
+  - Report each drifted or missing artifact by name and artifact path
 - Support `--json` output mode
 - Exit with code 0 when no drift is found, code 1 when drift is detected
 - Be invoked at the start of the `check` npm script so drift is caught before build runs
@@ -666,9 +680,17 @@ A new script `scripts/install-status.mjs` must:
 - Accept `--target <codex|claude>`, `--target-root <path>`, and `--json` flags
 - Read the state file written by `install-apply.mjs` at `.super-skills/install-state/<target>.json`
 - Report `NOT INSTALLED` if the state file does not exist
-- For each `targetPath` recorded in the state, verify the path exists under `targetRoot`
-- Exit with code 0 when all recorded paths exist, code 1 when any are missing
-- Avoid content hash comparison in v1.1 (path presence check is sufficient to detect broken installs)
+- Expand each recorded module operation from `state.pendingOperations` into concrete expected file paths,
+  then verify that each expanded path exists under `targetRoot`. This is required because `state.targetPaths`
+  records only top-level directories (e.g. `.claude/skills`), which may exist even when their contents are
+  missing or incomplete. Using `pendingOperations` to expand to actual expected files provides a more
+  accurate health signal.
+- Exit with code 0 when all expanded paths exist, code 1 when any are missing
+- Avoid content hash comparison in v1.1 (path presence check is sufficient for this iteration)
+
+Note: if `state.pendingOperations` does not provide sufficient resolution to enumerate individual files
+(e.g. for directory-copy operations), the script may fall back to checking that each `targetPath` entry
+is a non-empty directory rather than just checking existence.
 
 ### Convenience Entry Points
 
@@ -679,7 +701,8 @@ repository internals. The following npm scripts must be added to `package.json` 
 - `install:codex` — applies `developer` profile to `--target-root ~`
 - `install:plan:claude` — dry-run plan for `developer` profile against Claude target
 - `install:plan:codex` — dry-run plan for `developer` profile against Codex target
-- `install:status` — runs `install-status.mjs` against `--target-root ~`
+- `install:status:claude` — runs `install-status.mjs --target claude` against `--target-root ~`
+- `install:status:codex` — runs `install-status.mjs --target codex` against `--target-root ~`
 
 These scripts do not replace the low-level CLI; they are aliases for the most common invocations.
 

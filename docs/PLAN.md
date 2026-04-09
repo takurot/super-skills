@@ -772,10 +772,14 @@ Validation:
 Scope:
 
 - Create `scripts/check-drift.js` as a standalone Node.js script (CJS, consistent with other `scripts/*.js`)
-- For each directory in `skills/`:
-  - Hash the content of `SKILL.md` using SHA-256
-  - Compare against `.agents/skills/<name>/SKILL.md` hash (missing → drift)
-  - Compare against `.claude/skills/<name>/SKILL.md` hash (missing → drift)
+- For each directory in `skills/`, check three generated artifacts per skill:
+  - `.agents/skills/<name>/SKILL.md` — verbatim copy; compare SHA-256 of source directly against this file
+  - `.agents/skills/<name>/agents/openai.yaml` — derived from source metadata; regenerate expected YAML
+    in memory using the same `buildOpenAIYaml` logic as `build-skills.js` and compare against this file
+  - `.claude/skills/<name>/SKILL.md` — frontmatter-injected; render expected content in memory using
+    `injectClaudeFrontmatter` (from Task 10.1) and compare against this file. Do NOT compare source hash
+    directly because the injected `user-invocable: true` makes the content intentionally differ.
+- Report each drifted or missing artifact by skill name and artifact path
 - Output format (default):
   ```
   DRIFT  investigate   .claude/skills/investigate/SKILL.md (stale)
@@ -784,7 +788,12 @@ Scope:
   ```
 - Output format (`--json`):
   ```json
-  { "drifted": ["investigate", "review"], "ok": ["careful", ...] }
+  {
+    "drifted": [
+      { "skill": "investigate", "artifact": ".claude/skills/investigate/SKILL.md", "reason": "stale" }
+    ],
+    "ok": ["careful", ...]
+  }
   ```
 - Exit code 0 when no drift; exit code 1 when any drift detected
 - Update `package.json`:
@@ -793,7 +802,8 @@ Scope:
 
 Dependencies:
 
-- Task 10.1 must be complete so `.claude/skills/` contains injection-aware content before drift is meaningful
+- Task 10.1 must be complete: `injectClaudeFrontmatter` must be importable from `scripts/lib/skill-metadata.js`
+  before the Claude-target drift check can render expected content for comparison
 
 Deliverable:
 
@@ -804,6 +814,8 @@ Deliverable:
 Validation:
 
 - Modify `skills/review/SKILL.md` → `check:drift` exits 1 and reports `review` as drifted
+- Manually corrupt `.agents/skills/careful/agents/openai.yaml` → `check:drift` reports `careful` as drifted
+- Manually edit `.claude/skills/investigate/SKILL.md` to remove `user-invocable: true` → `check:drift` reports `investigate` as drifted
 - Run `npm run build:skills && npm run build:claude-skills` → `check:drift` exits 0
 
 ### Task 10.3: Add `--force` flag to `install-apply.mjs`
@@ -843,24 +855,32 @@ Scope:
 - Parse `--target <codex|claude>`, `--target-root <path>`, `--json` flags using the existing `parseArgs` from `install-lib.mjs`
 - Locate state file: `<targetRoot>/.super-skills/install-state/<target>.json`
 - If state file does not exist: report `NOT INSTALLED` and exit 1
-- For each path in `state.targetPaths`:
-  - Check whether path exists under `targetRoot`
-  - Collect `OK` and `MISSING` results
+- Expand `state.pendingOperations` into concrete expected paths:
+  - For `copy` operations: the `to` path is a concrete file or directory to check
+  - For `generate` operations whose `outputRoot` maps to a known directory: check that the output directory
+    is non-empty (individual generated files are not enumerated in v1.1)
+  - For `write-state` operations: skip (meta-operations, not user-visible files)
+  - Do NOT rely on `state.targetPaths` alone, as those are top-level directories that may exist even
+    when their contents are missing or incomplete
+- For each expanded path, verify existence under `targetRoot` and (for directories) non-emptiness
+- Collect `OK` and `MISSING` results
 - Default output:
   ```
   Installed: claude  profile=developer  at=2026-04-09T10:00:00Z
-  OK      .claude/skills
+  OK      .claude/skills (non-empty directory)
   MISSING .claude/AGENTS.md
   ```
 - JSON output:
   ```json
   { "installed": true, "target": "claude", "profile": "developer", "ok": [...], "missing": [...] }
   ```
-- Exit 0 when all paths present; exit 1 when any missing or not installed
+- Exit 0 when all expanded paths present; exit 1 when any missing or not installed
 
 Dependencies:
 
-- Task 10.3 (state file written correctly after apply); verify state format before implementing
+- No dependency on Task 10.3. The state file format written by `install-lib.mjs > writeStateFile` and
+  `buildStatePayload` already exists in the current implementation and is stable. Task 10.4 can be
+  implemented and tested independently of the `--force` change in Task 10.3.
 
 Deliverable:
 
@@ -879,11 +899,12 @@ Scope:
 - Add the following scripts to `package.json`:
 
   ```json
-  "install:claude":      "node scripts/install-apply.mjs --profile developer --target claude --target-root ~",
-  "install:codex":       "node scripts/install-apply.mjs --profile developer --target codex  --target-root ~",
-  "install:plan:claude": "node scripts/install-plan.mjs  --profile developer --target claude --target-root ~ --dry-run",
-  "install:plan:codex":  "node scripts/install-plan.mjs  --profile developer --target codex  --target-root ~ --dry-run",
-  "install:status":      "node scripts/install-status.mjs --target claude --target-root ~"
+  "install:claude":        "node scripts/install-apply.mjs --profile developer --target claude --target-root ~",
+  "install:codex":         "node scripts/install-apply.mjs --profile developer --target codex  --target-root ~",
+  "install:plan:claude":   "node scripts/install-plan.mjs  --profile developer --target claude --target-root ~ --dry-run",
+  "install:plan:codex":    "node scripts/install-plan.mjs  --profile developer --target codex  --target-root ~ --dry-run",
+  "install:status:claude": "node scripts/install-status.mjs --target claude --target-root ~",
+  "install:status:codex":  "node scripts/install-status.mjs --target codex  --target-root ~"
   ```
 
 - `~` resolves to `process.env.HOME` in Node via shell expansion; verify this works on macOS and Linux before committing
@@ -900,17 +921,18 @@ Deliverable:
 Validation:
 
 - `npm run install:plan:claude` exits 0 and prints profile/target summary
-- `npm run install:status` exits 0 after a successful `npm run install:claude`
+- `npm run install:status:claude` exits 0 after a successful `npm run install:claude`
+- `npm run install:status:codex` exits 0 after a successful `npm run install:codex`
 
 ## Execution Order (v1.1)
 
 Run Phase 10 tasks in dependency order:
 
 1. Task 10.1 (Claude frontmatter injection) — no dependencies
-2. Task 10.2 (drift detection) — after 10.1 so `.claude/skills/` is injection-aware
-3. Task 10.3 (--force flag) — no dependencies; parallel with 10.1 and 10.2
-4. Task 10.4 (install-status) — after 10.3 confirms state file correctness
-5. Task 10.5 (package.json entry points) — after 10.4
+2. Task 10.2 (drift detection) — after 10.1; requires `injectClaudeFrontmatter` to be importable
+3. Task 10.3 (--force flag) — no dependencies; can run in parallel with 10.1 and 10.2
+4. Task 10.4 (install-status) — no dependency on 10.3; can run in parallel with 10.1–10.3
+5. Task 10.5 (package.json entry points) — after 10.4 (`install-status.mjs` must exist)
 
 ## Definition of Done
 
