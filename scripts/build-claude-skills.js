@@ -2,7 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { extractFrontmatter, validateSourceSkillMetadata } = require("./lib/skill-metadata");
+const { extractFrontmatter, injectClaudeFrontmatter, validateSourceSkillMetadata } = require("./lib/skill-metadata");
 
 const ROOT = path.resolve(__dirname, "..");
 const SKILLS_DIR = path.join(ROOT, "skills");
@@ -33,6 +33,23 @@ function copyRecursive(source, destination) {
   fs.copyFileSync(source, destination);
 }
 
+function writeSkillPackage(skillName) {
+  const sourceDir = path.join(SKILLS_DIR, skillName);
+  const destinationDir = path.join(CLAUDE_SKILLS_DIR, skillName);
+
+  ensureDir(destinationDir);
+  for (const entry of fs.readdirSync(sourceDir)) {
+    const sourcePath = path.join(sourceDir, entry);
+    const destinationPath = path.join(destinationDir, entry);
+    if (entry === "SKILL.md") {
+      const content = fs.readFileSync(sourcePath, "utf8");
+      fs.writeFileSync(destinationPath, injectClaudeFrontmatter(content));
+      continue;
+    }
+    copyRecursive(sourcePath, destinationPath);
+  }
+}
+
 function main() {
   ensureDir(CLAUDE_SKILLS_DIR);
   removeDirContents(CLAUDE_SKILLS_DIR);
@@ -57,10 +74,17 @@ function main() {
     for (const warning of warnings) {
       console.warn(`WARN: ${warning}`);
     }
-    copyRecursive(path.join(SKILLS_DIR, skillName), path.join(CLAUDE_SKILLS_DIR, skillName));
+    writeSkillPackage(skillName);
   }
 
   console.log(`Generated ${skillDirs.length} Claude skill packages in .claude/skills`);
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  main,
+  writeSkillPackage,
+};

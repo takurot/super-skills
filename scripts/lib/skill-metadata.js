@@ -83,6 +83,34 @@ function normalizeDescription(description) {
   return String(description || "").replace(/\s+/g, " ").trim();
 }
 
+function injectClaudeFrontmatter(content) {
+  const { data, body, raw } = extractFrontmatter(content);
+  const hostSpecificKey = Object.keys(data).find((key) => HOST_SPECIFIC_FRONTMATTER_KEYS.includes(key));
+  if (hostSpecificKey) {
+    throw new Error(
+      `cannot inject Claude frontmatter when host-specific frontmatter '${hostSpecificKey}' is already present`,
+    );
+  }
+
+  const lines = raw.split("\n");
+  let insertionIndex = -1;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = lines[i].match(/^([A-Za-z0-9_-]+):\s*(?:\|\s*)?(?:.+)?$/);
+    if (!match) continue;
+    if (SOURCE_FRONTMATTER_KEYS.includes(match[1])) {
+      insertionIndex = i + 1;
+    }
+  }
+
+  if (insertionIndex === -1) {
+    throw new Error("cannot inject Claude frontmatter without source frontmatter keys");
+  }
+
+  const nextRaw = [...lines.slice(0, insertionIndex), "user-invocable: true", ...lines.slice(insertionIndex)].join("\n");
+  return `---\n${nextRaw}\n---\n${body}`;
+}
+
 function validateSourceSkillMetadata({ dirName, data }) {
   const errors = [];
   const warnings = [];
@@ -136,5 +164,6 @@ module.exports = {
   SOURCE_FRONTMATTER_KEYS,
   extractFrontmatter,
   normalizeDescription,
+  injectClaudeFrontmatter,
   validateSourceSkillMetadata,
 };

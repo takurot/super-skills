@@ -7,15 +7,22 @@
     "build:claude-skills": "node scripts/build-claude-skills.js",
     "build:skills": "node scripts/build-skills.js",
     "build:mcp-config": "node scripts/build-mcp-config.js",
+    "check:drift": "node scripts/check-drift.js",
     "scan:secrets": "node scripts/scan-secrets.js",
     "validate:configs": "node scripts/validate-configs.js",
     "validate:skills": "node scripts/validate-skills.js",
     "validate:mcp": "node scripts/build-mcp-config.js --validate",
     "install:plan": "node scripts/install-plan.mjs",
+    "install:plan:claude": "node scripts/install-plan.mjs --profile developer --target claude --target-root ~ --dry-run",
+    "install:plan:codex": "node scripts/install-plan.mjs --profile developer --target codex --target-root ~ --dry-run",
     "install:apply": "node scripts/install-apply.mjs",
+    "install:claude": "node scripts/install-apply.mjs --profile developer --target claude --target-root ~",
+    "install:codex": "node scripts/install-apply.mjs --profile developer --target codex --target-root ~",
+    "install:status:claude": "node scripts/install-status.mjs --target claude --target-root ~",
+    "install:status:codex": "node scripts/install-status.mjs --target codex --target-root ~",
     "install:validate": "node scripts/install-validate.mjs",
     "install:list": "node scripts/list-installables.mjs",
-    "check": "npm run validate:skills && npm run build:skills && npm run build:claude-skills && npm run validate:mcp && npm run validate:configs && npm run scan:secrets"
+    "check": "npm run check:drift && npm run validate:skills && npm run build:skills && npm run build:claude-skills && npm run validate:mcp && npm run validate:configs && npm run scan:secrets"
   },
   "engines": {
     "node": ">=18"

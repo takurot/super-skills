@@ -5,6 +5,7 @@ description: |
   and UI behavior. Use when building or reviewing interfaces and interaction
   flows in modern web apps.
 origin: unified
+user-invocable: true
 ---
 
 # Frontend Patterns

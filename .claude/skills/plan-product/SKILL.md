@@ -5,6 +5,7 @@ description: |
   Use for early product strategy, problem reframing, user-value sharpening, and
   design-direction planning before implementation starts.
 origin: unified
+user-invocable: true
 ---
 
 # Plan Product

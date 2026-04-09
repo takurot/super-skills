@@ -5,6 +5,7 @@ description: |
   preparation together. Use when work is ready to package, summarize, and move
   toward merge or deployment.
 origin: unified
+user-invocable: true
 ---
 
 # Ship Release

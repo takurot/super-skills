@@ -5,6 +5,7 @@ description: |
   edit boundaries together. Use for high-risk tasks where both command safety
   and edit containment matter.
 origin: unified
+user-invocable: true
 ---
 
 # Guard

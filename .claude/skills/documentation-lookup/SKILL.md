@@ -5,6 +5,7 @@ description: |
   docs and trusted references. Use when implementation depends on up-to-date APIs
   or version-specific behavior.
 origin: unified
+user-invocable: true
 ---
 
 # Documentation Lookup

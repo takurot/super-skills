@@ -5,6 +5,7 @@ description: |
   production issues, or any case where the real failure path must be understood
   before edits are proposed.
 origin: unified
+user-invocable: true
 ---
 
 # Investigate

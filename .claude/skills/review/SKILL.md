@@ -5,6 +5,7 @@ description: |
   boundaries, and missing tests. Use for diffs, pull requests, pre-merge review,
   or any request to check code quality.
 origin: unified
+user-invocable: true
 ---
 
 # Review

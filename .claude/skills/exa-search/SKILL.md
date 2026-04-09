@@ -5,6 +5,7 @@ description: |
   Use when broad external search is needed and the result should be ranked and
   summarized efficiently.
 origin: unified
+user-invocable: true
 ---
 
 # Exa Search

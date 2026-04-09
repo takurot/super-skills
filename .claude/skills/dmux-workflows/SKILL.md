@@ -5,6 +5,7 @@ description: |
   orchestration. Use when independent tasks can be split safely across isolated
   execution lanes.
 origin: unified
+user-invocable: true
 ---
 
 # dmux Workflows

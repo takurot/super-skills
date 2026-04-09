@@ -5,6 +5,7 @@ description: |
   Use during debugging or sensitive refactors to prevent unrelated changes from
   leaking into the session.
 origin: unified
+user-invocable: true
 ---
 
 # Freeze

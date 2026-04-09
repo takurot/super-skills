@@ -40,14 +40,14 @@ function readFileIfExists(filePath) {
   return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : null;
 }
 
-function copyFileSafely(sourcePath, destinationPath, { generated = false } = {}) {
+function copyFileSafely(sourcePath, destinationPath, { generated = false, force = false } = {}) {
   if (samePath(sourcePath, destinationPath)) {
     return;
   }
 
   const sourceContent = fs.readFileSync(sourcePath, "utf8");
   const existingContent = readFileIfExists(destinationPath);
-  if (existingContent !== null && existingContent !== sourceContent && !generated) {
+  if (existingContent !== null && existingContent !== sourceContent && !generated && !force) {
     throw new Error(`Refusing to overwrite authored file: ${destinationPath}`);
   }
 
@@ -55,7 +55,8 @@ function copyFileSafely(sourcePath, destinationPath, { generated = false } = {})
   fs.writeFileSync(destinationPath, sourceContent, "utf8");
 }
 
-function copyDirectorySafely(sourcePath, destinationPath, { generated = false } = {}) {
+function copyDirectorySafely(sourcePath, destinationPath, options = {}) {
+  const { generated = false } = options;
   if (samePath(sourcePath, destinationPath)) {
     return;
   }
@@ -69,7 +70,7 @@ function copyDirectorySafely(sourcePath, destinationPath, { generated = false } 
     copyPath(
       path.join(sourcePath, entry.name),
       path.join(destinationPath, entry.name),
-      { generated }
+      options
     );
   }
 }
@@ -105,12 +106,12 @@ function skillNamesForModule(module) {
     .map((match) => match[1]);
 }
 
-function copyGeneratedSkillSet(module, sourceRoot, destinationRoot) {
+function copyGeneratedSkillSet(module, sourceRoot, destinationRoot, options = {}) {
   for (const skillName of skillNamesForModule(module)) {
     copyDirectorySafely(
       path.join(repoRoot, sourceRoot, skillName),
       path.join(destinationRoot, skillName),
-      { generated: true }
+      { ...options, generated: true }
     );
   }
 }
@@ -144,20 +145,31 @@ function writeGeneratedTargetMetadata(plan, options) {
 function applyCopyOperation(operation, options) {
   copyPath(
     path.join(repoRoot, operation.from),
-    path.join(options.targetRoot, operation.to)
+    path.join(options.targetRoot, operation.to),
+    options
   );
 }
 
 function applyGenerateOperation(module, operation, plan, options) {
   if (operation.generator === "scripts/build-skills.js") {
     runGenerator(operation.generator);
-    copyGeneratedSkillSet(module, ".agents/skills", path.join(options.targetRoot, ".agents", "skills"));
+    copyGeneratedSkillSet(
+      module,
+      ".agents/skills",
+      path.join(options.targetRoot, ".agents", "skills"),
+      options
+    );
     return;
   }
 
   if (operation.generator === "scripts/build-claude-skills.js") {
     runGenerator(operation.generator);
-    copyGeneratedSkillSet(module, ".claude/skills", path.join(options.targetRoot, ".claude", "skills"));
+    copyGeneratedSkillSet(
+      module,
+      ".claude/skills",
+      path.join(options.targetRoot, ".claude", "skills"),
+      options
+    );
     return;
   }
 
@@ -165,7 +177,7 @@ function applyGenerateOperation(module, operation, plan, options) {
     copyFileSafely(
       path.join(repoRoot, ".codex", "config.toml"),
       path.join(options.targetRoot, ".codex", "config.toml"),
-      { generated: true }
+      { ...options, generated: true }
     );
     return;
   }
@@ -209,6 +221,7 @@ function usage() {
     "  --target-root <path>",
     "  --state-path <path>",
     "  --dry-run",
+    "  --force",
     "  --json"
   ].join("\n");
 }
@@ -231,10 +244,14 @@ try {
         mode: "dry-run",
         plan,
         statePath,
-        state
+        state,
+        force: options.force
       });
     } else {
       process.stdout.write(`${formatPlan(plan)}\n`);
+      if (options.force) {
+        process.stdout.write("\nForce mode: authored file overwrites enabled\n");
+      }
       process.stdout.write(`\nDry run only. State would be written to ${statePath}\n`);
       process.stdout.write("install-apply dry run completed. No files were written.\n");
     }

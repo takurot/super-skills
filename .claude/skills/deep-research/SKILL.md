@@ -5,6 +5,7 @@ description: |
   synthesis, and explicit confidence. Use for technical, product, market, or
   ecosystem investigations with evidence requirements.
 origin: unified
+user-invocable: true
 ---
 
 # Deep Research

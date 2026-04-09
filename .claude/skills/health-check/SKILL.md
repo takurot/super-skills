@@ -5,6 +5,7 @@ description: |
   Use to assess codebase readiness, run quality gates, or summarize engineering
   health before major changes or release.
 origin: unified
+user-invocable: true
 ---
 
 # Health Check
