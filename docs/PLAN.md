@@ -734,6 +734,184 @@ Rationale:
 - Make generation and runtime stable before adding many skills
 - Lock security and MCP defaults before installer automation and capability expansion
 
+## Phase 10: Skill Build Pipeline Enhancements (v1.1)
+
+These tasks address gaps identified after the v1 core was implemented. They do not restructure the pipeline;
+they fill specific holes in the existing scripts.
+
+### Task 10.1: Add Claude frontmatter injection to `build-claude-skills.js`
+
+Scope:
+
+- Add `injectClaudeFrontmatter(content)` to `scripts/lib/skill-metadata.js`
+  - Input: raw SKILL.md content string
+  - Output: content string with `user-invocable: true` inserted after the last source frontmatter key
+  - Must not modify source files; only operates on in-memory content
+- Update `scripts/build-claude-skills.js` to call `injectClaudeFrontmatter` before writing each skill
+- Write unit tests for `injectClaudeFrontmatter` covering:
+  - Standard injection case (user-invocable not present)
+  - Content with multiline description block
+  - Throws when content already contains a host-specific key (should not reach injection stage due to validate guard)
+
+Dependencies:
+
+- None; operates on existing `scripts/lib/skill-metadata.js` module
+
+Deliverable:
+
+- `.claude/skills/<name>/SKILL.md` files contain `user-invocable: true` in frontmatter after build
+
+Validation:
+
+- `npm run build:claude-skills && grep -r "user-invocable: true" .claude/skills/` returns one match per skill
+- `npm run validate:skills` continues to pass (source skills unchanged)
+- Unit tests pass
+
+### Task 10.2: Implement drift detection script
+
+Scope:
+
+- Create `scripts/check-drift.js` as a standalone Node.js script (CJS, consistent with other `scripts/*.js`)
+- For each directory in `skills/`:
+  - Hash the content of `SKILL.md` using SHA-256
+  - Compare against `.agents/skills/<name>/SKILL.md` hash (missing → drift)
+  - Compare against `.claude/skills/<name>/SKILL.md` hash (missing → drift)
+- Output format (default):
+  ```
+  DRIFT  investigate   .claude/skills/investigate/SKILL.md (stale)
+  DRIFT  review        .agents/skills/review/SKILL.md (missing)
+  OK     careful
+  ```
+- Output format (`--json`):
+  ```json
+  { "drifted": ["investigate", "review"], "ok": ["careful", ...] }
+  ```
+- Exit code 0 when no drift; exit code 1 when any drift detected
+- Update `package.json`:
+  - Add `"check:drift": "node scripts/check-drift.js"`
+  - Prepend `npm run check:drift &&` to the existing `check` script
+
+Dependencies:
+
+- Task 10.1 must be complete so `.claude/skills/` contains injection-aware content before drift is meaningful
+
+Deliverable:
+
+- `npm run check:drift` passes on a clean build
+- `npm run check:drift` fails with exit 1 after manually modifying a source skill without rebuilding
+- `npm run check` runs drift check before building
+
+Validation:
+
+- Modify `skills/review/SKILL.md` → `check:drift` exits 1 and reports `review` as drifted
+- Run `npm run build:skills && npm run build:claude-skills` → `check:drift` exits 0
+
+### Task 10.3: Add `--force` flag to `install-apply.mjs`
+
+Scope:
+
+- In `scripts/install-lib.mjs > parseArgs`, add `--force` flag → `options.force = false` default, `true` when passed
+- In `scripts/install-apply.mjs > copyFileSafely`, change authored-file guard:
+  ```
+  Before: throw when content differs and !generated
+  After:  throw when content differs and !generated and !options.force
+  ```
+- Forward `options.force` from `applyPlan` call site into `copyFileSafely` and `copyDirectorySafely`
+- In dry-run text output, add line `Force mode: authored file overwrites enabled` when `options.force` is true
+- Update usage string in `install-apply.mjs` to document `--force`
+
+Dependencies:
+
+- None; isolated change to existing apply logic
+
+Deliverable:
+
+- `--force` flag accepted without error
+- Re-running install after local edits to an authored target file succeeds with `--force`, fails without it
+
+Validation:
+
+- Install to a temp dir → manually edit `.claude/AGENTS.md` → re-run install without `--force` → exits 1
+- Re-run install with `--force` → exits 0, file is overwritten
+- Dry-run with `--force` prints `Force mode` notice
+
+### Task 10.4: Implement `install-status.mjs`
+
+Scope:
+
+- Create `scripts/install-status.mjs` (ESM, consistent with other `scripts/*.mjs` installer scripts)
+- Parse `--target <codex|claude>`, `--target-root <path>`, `--json` flags using the existing `parseArgs` from `install-lib.mjs`
+- Locate state file: `<targetRoot>/.super-skills/install-state/<target>.json`
+- If state file does not exist: report `NOT INSTALLED` and exit 1
+- For each path in `state.targetPaths`:
+  - Check whether path exists under `targetRoot`
+  - Collect `OK` and `MISSING` results
+- Default output:
+  ```
+  Installed: claude  profile=developer  at=2026-04-09T10:00:00Z
+  OK      .claude/skills
+  MISSING .claude/AGENTS.md
+  ```
+- JSON output:
+  ```json
+  { "installed": true, "target": "claude", "profile": "developer", "ok": [...], "missing": [...] }
+  ```
+- Exit 0 when all paths present; exit 1 when any missing or not installed
+
+Dependencies:
+
+- Task 10.3 (state file written correctly after apply); verify state format before implementing
+
+Deliverable:
+
+- `scripts/install-status.mjs` command functional for `codex` and `claude` targets
+
+Validation:
+
+- Install to temp dir → `install-status.mjs --target claude --target-root <dir>` exits 0
+- Delete `.claude/AGENTS.md` → `install-status.mjs` exits 1 and reports `MISSING`
+- No state file → exits 1 and reports `NOT INSTALLED`
+
+### Task 10.5: Add convenience `package.json` entry points
+
+Scope:
+
+- Add the following scripts to `package.json`:
+
+  ```json
+  "install:claude":      "node scripts/install-apply.mjs --profile developer --target claude --target-root ~",
+  "install:codex":       "node scripts/install-apply.mjs --profile developer --target codex  --target-root ~",
+  "install:plan:claude": "node scripts/install-plan.mjs  --profile developer --target claude --target-root ~ --dry-run",
+  "install:plan:codex":  "node scripts/install-plan.mjs  --profile developer --target codex  --target-root ~ --dry-run",
+  "install:status":      "node scripts/install-status.mjs --target claude --target-root ~"
+  ```
+
+- `~` resolves to `process.env.HOME` in Node via shell expansion; verify this works on macOS and Linux before committing
+
+Dependencies:
+
+- Task 10.4 (`install-status.mjs` must exist before its entry point is added)
+
+Deliverable:
+
+- `npm run install:plan:claude` produces a readable plan without flags
+- `npm run install:claude` installs to `~` with no additional arguments
+
+Validation:
+
+- `npm run install:plan:claude` exits 0 and prints profile/target summary
+- `npm run install:status` exits 0 after a successful `npm run install:claude`
+
+## Execution Order (v1.1)
+
+Run Phase 10 tasks in dependency order:
+
+1. Task 10.1 (Claude frontmatter injection) — no dependencies
+2. Task 10.2 (drift detection) — after 10.1 so `.claude/skills/` is injection-aware
+3. Task 10.3 (--force flag) — no dependencies; parallel with 10.1 and 10.2
+4. Task 10.4 (install-status) — after 10.3 confirms state file correctness
+5. Task 10.5 (package.json entry points) — after 10.4
+
 ## Definition of Done
 
 The first meaningful milestone is complete when:
@@ -753,3 +931,11 @@ The broader v1 is complete when:
 - modular expansion skills are added
 - plugin adapters are present and opt-in
 - security defaults are verified and documented
+
+v1.1 is complete when:
+
+- `.claude/skills/` contains `user-invocable: true` in all generated skill frontmatter
+- `npm run check:drift` detects stale generated artifacts
+- `npm run install:claude` and `npm run install:codex` work without additional flags
+- `npm run install:status` reports install health
+- `--force` flag allows safe re-installation over modified authored files
