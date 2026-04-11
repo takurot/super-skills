@@ -90,4 +90,13 @@ function main() {
   console.log(`Generated ${skillDirs.length} skill packages in .agents/skills`);
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  buildOpenAIYaml,
+  main,
+  sentenceCaseToDisplayName,
+  shortDescription,
+};

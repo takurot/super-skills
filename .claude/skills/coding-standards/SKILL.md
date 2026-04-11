@@ -5,6 +5,7 @@ description: |
   Use when writing or reviewing code to keep naming, structure, validation, and
   error-handling expectations consistent.
 origin: unified
+user-invocable: true
 ---
 
 # Coding Standards

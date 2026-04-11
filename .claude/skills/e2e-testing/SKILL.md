@@ -5,6 +5,7 @@ description: |
   Use when validating full-stack behavior, regression-prone journeys, or release
   gates for visible product functionality.
 origin: unified
+user-invocable: true
 ---
 
 # E2E Testing

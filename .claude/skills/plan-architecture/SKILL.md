@@ -5,6 +5,7 @@ description: |
   Use for system design, API shape, data flow, edge cases, and testable execution
   sequencing before code changes begin.
 origin: unified
+user-invocable: true
 ---
 
 # Plan Architecture

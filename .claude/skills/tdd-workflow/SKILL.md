@@ -5,6 +5,7 @@ description: |
   Use to force test-first implementation with explicit coverage expectations and
   clear red-green-refactor sequencing.
 origin: unified
+user-invocable: true
 ---
 
 # TDD Workflow

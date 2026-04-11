@@ -5,6 +5,7 @@ description: |
   rewrite git history, discard changes, or modify high-risk infrastructure and
   data paths.
 origin: unified
+user-invocable: true
 ---
 
 # Careful

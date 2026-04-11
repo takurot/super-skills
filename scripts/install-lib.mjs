@@ -63,6 +63,7 @@ function parseArgs(argv) {
     with: [],
     without: [],
     dryRun: false,
+    force: false,
     json: false,
     config: undefined,
     targetRoot: process.cwd(),
@@ -119,6 +120,11 @@ function parseArgs(argv) {
 
     if (arg === "--dry-run") {
       options.dryRun = true;
+      continue;
+    }
+
+    if (arg === "--force") {
+      options.force = true;
       continue;
     }
 

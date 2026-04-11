@@ -5,6 +5,7 @@ description: |
   attack surface. Use when code touches auth, user input, external tools, secrets,
   file access, or high-trust automation.
 origin: unified
+user-invocable: true
 ---
 
 # Security Review

@@ -5,6 +5,7 @@ description: |
   Use for end-to-end checking, report-only QA, or iterative test-and-fix loops
   around visible product behavior.
 origin: unified
+user-invocable: true
 ---
 
 # QA Browser

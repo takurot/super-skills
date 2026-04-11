@@ -5,6 +5,7 @@ description: |
   boundaries. Use when cataloging MCP servers, building new servers, or reviewing
   MCP-related risk and integration choices.
 origin: unified
+user-invocable: true
 ---
 
 # MCP Server Patterns

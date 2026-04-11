@@ -5,6 +5,7 @@ description: |
   persistence, and caching. Use when building or refactoring backend flows and
   server-side systems.
 origin: unified
+user-invocable: true
 ---
 
 # Backend Patterns
