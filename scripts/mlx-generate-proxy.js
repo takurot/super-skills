@@ -299,17 +299,25 @@ async function startMlx() {
   }
 }
 
-async function stopMlx(reason) {
+async function stopMlx(reason, opts = {}) {
   if (state.value === 'STOPPED') return;
-  if (state.active_requests > 0) {
+  // M2 bug fix (2026-04-20, agent a0d2fd95): when eviction is called
+  // from the request handler, active_requests is 1 (the request
+  // itself) and this guard would silently skip bootout, leaving
+  // cache_evictions metric ticking while no actual eviction
+  // happened. `force: true` bypasses the guard for planned evictions
+  // where the caller knows their own request is the only live one.
+  // Idle-watchdog path still uses the default (no force) so it
+  // never kills live requests.
+  if (state.active_requests > 0 && !opts.force) {
     logLine(`stop skipped: ${state.active_requests} active requests`);
     return;
   }
-  logLine(`MLX stopping: ${reason}`);
+  logLine(`MLX stopping: ${reason}${opts.force ? ' (forced)' : ''}`);
   const ok = await launchctlBootout();
   state.value = 'STOPPED';
   state.metrics.bootouts++;
-  if (ok) logLine('MLX stopped (launchctl bootout)');
+  if (ok) logLine(`MLX stopped (launchctl bootout${opts.force ? ', forced' : ''})`);
 }
 
 // ── Idle watchdog ────────────────────────────────────────────────
@@ -451,7 +459,11 @@ async function handleRequest(req, res) {
         && state.active_requests === 1  /* only this req is live */) {
       logLine(`M2 cache eviction: ${state.requests_since_bootstrap} reqs served, bootout + restart`);
       state.metrics.cache_evictions++;
-      try { await stopMlx('M2-cache-eviction'); } catch (e) { logLine('M2 stop failed:', e.message); }
+      // force:true bypasses the `active_requests > 0` guard in stopMlx
+      // — this request IS the sole active one, and we want to evict
+      // BEFORE forwarding. Without force, bootout was silently
+      // skipped (bug caught by agent a0d2fd95, 2026-04-20).
+      try { await stopMlx('M2-cache-eviction', { force: true }); } catch (e) { logLine('M2 stop failed:', e.message); }
       // state.value is now STOPPED; next block will bootstrap.
     }
 

@@ -17,7 +17,7 @@ exec python3 -m mlx_lm.server \
   --model "${MODEL}" \
   --draft-model "${DRAFT_MODEL}" \
   --num-draft-tokens 5 \
-  --prompt-cache-size 20 \
+  --prompt-cache-size 8 \
   --prompt-cache-bytes 1073741824 \
   --port "${PORT}" \
   --host "${HOST}"
