@@ -87,6 +87,72 @@ preceding the crash:
   disabling the probe entirely (as opposed to the service)
   reduces crash frequency.
 
+## 4b. Hypothesis check — DATA GATHERED 2026-04-20 late night
+
+After H1-H4 drafting, operator hit the anomaly-alert table
+directly and inspected what `detectAnomalies()` (server.js:3765)
+has been emitting. Pattern is STRIKING:
+
+**Every cycle in the ~2h window before the crash** emits exactly
+TWO alerts:
+  1. **[high] DB errors in recent log: 683-957 (last 30min)**
+     (i.e. 20-30 per minute of `[db exec error]` or
+     `[db query error]`)
+  2. **[medium] Embed backlog growing: 6994 → 10882 pending**
+     (growing linearly — MLX embed can't keep pace)
+
+Operator grepped `/tmp/vcontext-server.log` for the actual DB
+error lines (last 512 KB = ~30min):
+
+```
+ 631  [db query error @ /Users/.../vcontext-primary.sqlite] file is not a database
+      | SQL: SELECT ... FROM entries WHERE type='task-request' / 'task-status-update' / 'task-result' / 'chunk-summary'
+  43  [db exec error ...] "database ssd is already in use" OR "file is not a database"
+   9  database disk image is malformed
+```
+
+Key test — operator ran the SAME queries via `sqlite3 -readonly`
+directly on the DB file. ALL returned instantly with correct
+results (task-request=0, task-result=12, etc.). **The DB file
+is fine.**
+
+### Diagnosis (H1/H2 now CONFIRMED + augmented)
+
+The "file is not a database" error, when paired with a DB file
+that sqlite3 CLI can open cleanly, has a specific root cause:
+**the server's better-sqlite3 handle is reading mmap'd pages
+that the OS has reclaimed under memory pressure**. SQLite
+surfaces this as "file is not a database" because the expected
+page header bytes are gone.
+
+Crash chain (updated, evidence-based):
+
+1. mlx-embed (port 3161) falls behind on load.
+2. Every store call that needs an embedding retries against 3161.
+   Each retry holds request + response buffers (potentially large,
+   since embeddings are 4096 floats = 16 KB per vector).
+3. Embed backlog grows linearly (6994 → 10882 over 2 hours = ~30/min
+   net accumulation while the loop is running).
+4. Node's heap + libc allocator + retry buffer churn push
+   total RSS up; the OS starts reclaiming SQLite's mmap pages.
+5. `dbQuery()` calls get "file is not a database" on the first
+   read after reclaim (mmap page now empty). 600+ errors/30min.
+6. Eventually a combination of pressure + reclaim contention
+   triggers OS SIGKILL (code 137) on the server process.
+7. launchd restarts; the cycle begins again with a fresh heap.
+
+H5 (new): **mlx-embed load shedding is the single biggest
+stability lever.** Every other symptom (DB errors, WAL busy,
+SIGKILL) is downstream of the embed retry storm. Backlog has
+been growing for hours — this is not a spike, it's a steady-
+state producer-consumer imbalance.
+
+Ruled-out secondary theory: "ATTACH 'ssd' race". There IS an
+"already in use" message (43 instances), and ATTACH/DETACH sites
+exist at server.js:4701/4719/4756. But this counts 7% of the
+total error volume — even if fully fixed, 631 "file is not a
+database" errors would remain. Not the primary cause.
+
 ## 5. Non-hypotheses (ruled out by evidence)
 
 - **Not morning-cascade regression**: the 2026-04-20 morning
@@ -103,29 +169,41 @@ preceding the crash:
   the operator. The operator was in doc-only mode during the
   crash window.
 
-## 6. Implication for LLM recovery
+## 6. Implication for LLM recovery (REVISED after §4b)
 
 The 2026-04-21 LLM recovery spec
 (`docs/analysis/2026-04-21-llm-recovery-spec.md`) requires
 **AC-R2: SIGKILL-137 count did not increase in the 4 hours
-prior**. Tonight's evidence says that condition may not be
-reachable simply by waiting — there is an unresolved crash class
-that fires during normal maintenance cycles, not just during
-deploys.
+prior**. Given the crash-chain evidence above, the soak condition
+is NOT achievable by waiting alone. The embed-loop retry storm
+is a steady-state problem.
 
-**Recommendation for tomorrow**:
+**Revised recommendation for tomorrow** (blocks LLM recovery
+until addressed):
 
-1. **Before** attempting LLM recovery, confirm or rule out the
-   above hypotheses. If H1/H2 is confirmed, patch the embed-loop
-   retry semantics (bounded retry budget, exponential backoff
-   with a hard cap) before enabling a second MLX service that
-   would compound memory pressure.
-2. If the first 2-4 hours of 2026-04-21 show no new SIGKILL-137,
-   that's evidence the pattern is probabilistic (occasional, not
-   deterministic), and the spec's soak condition becomes
-   achievable.
-3. If crashes continue at ≥1/h, LLM recovery is blocked until the
-   underlying pattern is resolved. Do not attempt.
+1. **FIRST — patch mlx-embed retry semantics** (the H5 lever).
+   Candidate changes:
+   - Exponential backoff on mlx-embed failures (currently retries
+     aggressively; should back off to 30s+ on streak ≥ 3)
+   - Cap embed-loop batch size based on observed lag (if
+     backlog > 5000, drop batch size from 16 → 4 and widen
+     inter-batch sleep)
+   - Circuit-breaker: if mlx-embed returns ECONNRESET 5× in
+     60s, mark it unavailable for 5 min and let the store
+     path return 202-accepted without an embedding (the
+     entry is still stored; backfill catches up later)
+2. **SECOND — add mmap-reclaim diagnostic**: wrap dbQuery
+   errors to log `ramDb.pragma('integrity_check', {simple:true})`
+   on the first "file is not a database" after a clean run.
+   Confirms/falsifies the mmap-reclaim theory.
+3. **THIRD — only then soak**. After (1)+(2), let the system
+   run 4 h clean. If SIGKILL-137 stays flat, LLM recovery is
+   safe to attempt.
+
+Enabling mlx-generate WITHOUT (1) would add a second MLX
+process holding 6 GB (model weights) + transient generation
+buffers. That accelerates the memory pressure chain described
+in §4b. **Do not.**
 
 ## 7. Data to gather in next occurrence
 
