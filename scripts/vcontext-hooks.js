@@ -1901,6 +1901,25 @@ async function handleSessionRecall() {
     lines.push('');
   }
 
+  // SKAP Phase B (2026-04-20): pull AIOS-wide shared knowledge from
+  // /aios/bootstrap and inject it right after MANDATORY RULES. This
+  // is how lesson-learned / design-proposal entries cross the
+  // session boundary — the current session Claude reads them the
+  // same way a Gemini / Codex client would over HTTP (via SKAP).
+  //
+  // Fail-open: bootstrap is a nice-to-have enrichment; if the
+  // endpoint is down or returns unexpected data, session-recall
+  // continues without it.
+  try {
+    const boot = await getAdmin('/aios/bootstrap?format=system-prompt&limit=20');
+    const md = (boot && boot.status === 200 && boot.body && typeof boot.body.raw === 'string')
+      ? boot.body.raw : '';
+    if (md && md.length > 50) {
+      lines.push(md);
+      lines.push('');
+    }
+  } catch { /* non-fatal */ }
+
   // Own session entries first
   if (own.results && own.results.length > 0) {
     lines.push('### This Session');
