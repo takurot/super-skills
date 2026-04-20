@@ -2723,6 +2723,174 @@ paths:
         '503':
           description: ramdb_unavailable.
 
+  /admin/db-size:
+    get:
+      tags: [admin]
+      operationId: adminDbSize
+      summary: Primary DB size via in-process PRAGMA + on-disk file stat
+      description: |
+        Stage 4.5 C7b. Read-only helper. Reports page-based size (page_size
+        × page_count via ramDb) plus file-system size and WAL/SHM sidecar
+        sizes. Replaces the PRAGMA page_size/page_count spawnSync that
+        cmdPolicyCheck used to run against primary.sqlite.
+      security:
+        - AdminHeader: []
+      parameters:
+        - in: header
+          name: X-Vcontext-Admin
+          required: true
+          schema: { type: string, enum: [yes] }
+      responses:
+        '200':
+          description: DB size report.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pages:
+                    type: object
+                    properties:
+                      page_size: { type: integer }
+                      page_count: { type: integer }
+                      bytes: { type: integer }
+                  file:
+                    type: object
+                    properties:
+                      bytes: { type: integer }
+                      wal_bytes: { type: integer }
+                      shm_bytes: { type: integer }
+                  path: { type: string }
+                  ran_at: { type: string, format: date-time }
+        '403':
+          description: Missing X-Vcontext-Admin header.
+        '503':
+          description: ramdb_unavailable.
+
+  /admin/kb-diff:
+    get:
+      tags: [admin, aios]
+      operationId: adminKbDiff
+      summary: Detect drift between ~/.claude/CLAUDE.md and vcontext shared-knowledge
+      description: |
+        SKAP v1 Phase F. Enforcement layer for
+        docs/principles/shared-knowledge-source-of-truth.md. Scans
+        CLAUDE.md for [id=NNNNN] references and title substrings,
+        compares against live lesson-learned + decision entries in
+        session=aios-shared-knowledge.
+
+        Scope: drift detection only covers lesson-learned + decision
+        (rules). design-proposal entries are intentionally excluded
+        because they are in-flight HITL pending decisions — their
+        absence from CLAUDE.md is expected.
+
+        Returns status='in-sync' iff both counts are 0, else 'drift'.
+      security:
+        - AdminHeader: []
+      parameters:
+        - in: header
+          name: X-Vcontext-Admin
+          required: true
+          schema: { type: string, enum: [yes] }
+      responses:
+        '200':
+          description: Drift report.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  generated_at: { type: string, format: date-time }
+                  claude_md_path: { type: string }
+                  claude_md_bytes: { type: integer }
+                  vcontext_shared_entries: { type: integer }
+                  drift:
+                    type: object
+                    properties:
+                      missing_in_claude_md:
+                        type: object
+                        properties:
+                          count: { type: integer }
+                          entries:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                id: { type: integer }
+                                type: { type: string }
+                                title: { type: string }
+                      dangling_refs_in_claude_md:
+                        type: object
+                        properties:
+                          count: { type: integer }
+                          ids:
+                            type: array
+                            items: { type: integer }
+                  matched_by_id: { type: integer }
+                  matched_by_title: { type: integer }
+                  status: { type: string, enum: [in-sync, drift] }
+        '403':
+          description: Missing X-Vcontext-Admin header.
+        '503':
+          description: ramdb_unavailable OR claude_md_not_readable.
+
+  /aios/mcp-manifest:
+    get:
+      tags: [aios]
+      operationId: aiosMcpManifest
+      summary: SKAP v1 Phase C — MCP-compatible tool manifest (4 tools)
+      description: |
+        Publishes tool definitions that MCP-compatible AI hosts
+        (Claude Desktop, Gemini CLI, Codex, any MCP bridge) can
+        consume to discover AIOS shared-knowledge operations. Each
+        tool's `resolves_to` field documents the actual HTTP call
+        the host should emit when the tool is invoked.
+
+        Tools:
+          - aios_recall_lessons          (read)
+          - aios_recall_decisions        (read)
+          - aios_recall_design_proposals (read)
+          - aios_store_lesson            (write; user-confirmation-required)
+
+        Manifest is publicly readable (no auth header); tool calls
+        themselves inherit the auth of their resolved endpoint.
+      responses:
+        '200':
+          description: Tool manifest.
+          headers:
+            Cache-Control: { schema: { type: string }, description: 'public, max-age=300' }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string, enum: [skap-1] }
+                  source: { type: string }
+                  base_url: { type: string }
+                  description: { type: string }
+                  tools:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        description: { type: string }
+                        inputSchema: { type: object, description: 'JSON Schema for tool inputs' }
+                        resolves_to:
+                          type: object
+                          properties:
+                            method: { type: string, enum: [GET, POST] }
+                            url: { type: string }
+                            auth: { type: string }
+                            response_field: { type: string }
+                            body_template: { type: object }
+                        write_gate: { type: string }
+                  notes:
+                    type: array
+                    items: { type: string }
+                  source_of_truth: { type: string }
+                  generated_at: { type: string, format: date-time }
+
   /aios/bootstrap:
     get:
       tags: [aios]
