@@ -8915,10 +8915,14 @@ const server = createServer(async (req, res) => {
           });
         }
 
-        // Pull all shared-knowledge entries (matches /aios/bootstrap
-        // scope exactly — that's the canonical cross-AI truth).
-        const SHARED_TYPES = ['lesson-learned', 'decision', 'design-proposal'];
-        const SHARED_SESSIONS = ['aios-shared-knowledge', 'aios-design-proposals'];
+        // Drift detection is scoped to types that SHOULD appear in
+        // CLAUDE.md as cached rules: lesson-learned (failure patterns)
+        // and decision (architectural choices). design-proposal
+        // entries are in-flight awaiting HITL — they are expected to
+        // NOT have a CLAUDE.md reference (the decision hasn't landed
+        // yet). Flagging them as drift would produce noise.
+        const SHARED_TYPES = ['lesson-learned', 'decision'];
+        const SHARED_SESSIONS = ['aios-shared-knowledge'];
         const tPh = SHARED_TYPES.map(() => '?').join(',');
         const sPh = SHARED_SESSIONS.map(() => '?').join(',');
         let rows = [];
