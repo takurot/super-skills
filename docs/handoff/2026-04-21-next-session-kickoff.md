@@ -144,8 +144,10 @@ launchctl disable gui/$(id -u)/com.vcontext.mlx-generate
 ## Artifacts from 2026-04-20 (for context)
 
 - `docs/principles/AIOS-CONSTITUTION.md` — 4 axioms + 6 principles + HITL
+- `docs/principles/shared-knowledge-source-of-truth.md` — **NEW evening**: vcontext is source of truth, CLAUDE.md is cache
 - `docs/specs/2026-04-20-true-loose-coupling-redesign.md` — parent spec (Stage 1-4)
 - `docs/specs/2026-04-21-stage-4.5-spec.md` — **THIS SESSION'S TARGET**
+- `docs/specs/2026-04-21-aios-shared-knowledge-access-protocol.md` — **NEW evening**: SKAP v1 (cross-AI bootstrap endpoint, Phase A-F)
 - `docs/specs/2026-04-20-ts-strict-migration-plan.md` — TS Phase 2 (H3, deferred)
 - `docs/specs/2026-04-20-mlx-lazy-load-proxy.md` — proxy spec
 - `docs/schemas/vcontext-api-v1.yaml` — OpenAPI, 78 endpoints (75 + 3 admin trio)
@@ -155,6 +157,22 @@ launchctl disable gui/$(id -u)/com.vcontext.mlx-generate
 - `docs/analysis/phase-stage-2-review.md` — phase-gate review
 - `docs/runbooks/hooks-phase1-rollback.md` — <30s rollback
 - `docs/roadmap/model-candidates.md` — Qwen3.6 deferred
+
+### New vcontext shared-knowledge entries (2026-04-20 evening)
+
+- `design-proposal` id=224670 — self-critique v2 (pre+post dual-layer)
+- `lesson-learned` id=224681 — dramatic-diagnosis
+- `lesson-learned` id=224682 — self-congratulatory-framing
+- `lesson-learned` id=224683 — stale-price-claim
+- `lesson-learned` id=224684 — dismissive-negation
+- all under session=`aios-shared-knowledge`, tags include `evidence-before-claim`
+
+### Evening additions to Priority pipeline
+
+- **P1.5 (after Stage 4.5 C10)**: SKAP Phase A+B — `/aios/bootstrap` endpoint + SessionStart hook integration. ~150 LOC, H2.
+- **P1.6 (after P1.5)**: SKAP Phase C+D — MCP manifest + Tailscale runbook. Opens cross-AI access.
+- **Hygiene**: 2 `[object Object]` rows in entries table (id=224646 + 1 other) to be cleaned by Stage 4.5 C10 hardening sweep. Root cause: `/store` accepted object for `content` field and coerced to "[object Object]" via implicit toString — add content-type validation in same C10 commit.
+- **Bug**: MLX embed path throws `s.slice is not a function` when content is not a string. Bounded by C10 validation fix; until then, clients MUST pre-serialize objects to JSON strings before POST /store.
 
 ---
 
