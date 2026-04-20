@@ -182,6 +182,21 @@
     <div id="task-queue-content" style="max-height:420px;overflow-y:auto;font-size:12px;">Loading...</div>
   </div>
 
+  <!-- Stage 4.5 + SKAP v1 observability (shipped 2026-04-20).
+       Read-only snapshot of the new admin endpoints. No action
+       buttons — this card exists to make the new infrastructure
+       visible, not to let owners accidentally trigger a VACUUM. -->
+  <div class="card wide">
+    <h2>⚙️ Stage 4.5 + SKAP v1 — Admin Snapshot</h2>
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;line-height:1.55;">
+      Live state of the loose-coupling endpoints shipped 2026-04-20.
+      All reads below hit server-internal HTTP contracts (no external
+      sqlite3 spawns). See <code>docs/specs/2026-04-21-stage-4.5-spec.md</code>
+      and <code>docs/specs/2026-04-21-aios-shared-knowledge-access-protocol.md</code>.
+    </div>
+    <div id="stage45-content" style="font-size:12px;line-height:1.7;">Loading...</div>
+  </div>
+
   <!-- Pillar 3 — Causal Trace. User enters an entry id, we walk the
        parent_id chain via GET /trace/:id and show root→target→children.
        Not auto-fetched (needs an id the user provides). -->
@@ -263,6 +278,17 @@ function setTheme(mode) {
 async function fetchJson(path) {
   try {
     const r = await fetch(API + path);
+    return await r.json();
+  } catch { return null; }
+}
+
+// Stage 4.5 / SKAP admin endpoints need X-Vcontext-Admin: yes.
+// Returns null on network error so callers can render "n/a" without
+// tripping on Promise rejection.
+async function fetchAdminJson(path) {
+  try {
+    const r = await fetch(API + path, { headers: { 'X-Vcontext-Admin': 'yes' } });
+    if (!r.ok && r.status !== 304) return { _status: r.status };
     return await r.json();
   } catch { return null; }
 }
@@ -705,6 +731,17 @@ async function refresh() {
     fetchJson('/admin/task-queue'),
     // Pillar 4 — Predictive Ambience: top-K "likely next" hints
     fetchJson('/predict/next?limit=5'),
+  ]);
+
+  // Stage 4.5 + SKAP v1 admin snapshot — parallel fetch via the
+  // admin-gated endpoints shipped 2026-04-20. Each call has its
+  // own try/catch so a single slow endpoint can't stall the whole
+  // card. Rendered at bottom of refresh().
+  const [dbSize, kbDiff, metricsWin, bootstrap] = await Promise.all([
+    fetchAdminJson('/admin/db-size'),
+    fetchAdminJson('/admin/kb-diff'),
+    fetchAdminJson('/admin/metrics/window?hours=1&metric=all'),
+    fetchAdminJson('/aios/bootstrap?limit=50'),
   ]);
 
   // Alerts
@@ -1478,6 +1515,88 @@ async function refresh() {
     document.getElementById('metrics-content').innerHTML = mhtml;
   } else {
     document.getElementById('metrics-content').innerHTML = '<div style="color:var(--text-muted);">No metrics data</div>';
+  }
+
+  // Stage 4.5 + SKAP v1 card render.
+  try {
+    var s45 = document.getElementById('stage45-content');
+    if (s45) {
+      var rows = [];
+
+      // DB size
+      if (dbSize && dbSize.pages) {
+        var mb = (dbSize.pages.bytes / 1048576).toFixed(0);
+        var walMb = ((dbSize.file && dbSize.file.wal_bytes) || 0) / 1048576;
+        rows.push(
+          '<div><b>DB size</b>: ' + mb + ' MB'
+          + ' &nbsp;·&nbsp; WAL: ' + walMb.toFixed(1) + ' MB'
+          + ' &nbsp;·&nbsp; pages: ' + (dbSize.pages.page_count || 0).toLocaleString()
+          + ' × ' + (dbSize.pages.page_size || 0) + 'B'
+          + ' &nbsp;<span style="color:var(--text-dim);">via /admin/db-size</span></div>'
+        );
+      }
+
+      // kb-diff
+      if (kbDiff && kbDiff.status) {
+        var dotColor = kbDiff.status === 'in-sync' ? 'var(--green)' : 'var(--yellow)';
+        var missCnt = kbDiff.drift && kbDiff.drift.missing_in_claude_md && kbDiff.drift.missing_in_claude_md.count || 0;
+        var danglingCnt = kbDiff.drift && kbDiff.drift.dangling_refs_in_claude_md && kbDiff.drift.dangling_refs_in_claude_md.count || 0;
+        rows.push(
+          '<div><b>CLAUDE.md ↔ vcontext</b>: '
+          + '<span class="status-dot" style="background:' + dotColor + ';"></span>'
+          + kbDiff.status
+          + ' &nbsp;·&nbsp; entries: ' + (kbDiff.vcontext_shared_entries || 0)
+          + ' &nbsp;·&nbsp; missing: ' + missCnt
+          + ' &nbsp;·&nbsp; dangling: ' + danglingCnt
+          + ' &nbsp;<span style="color:var(--text-dim);">via /admin/kb-diff</span></div>'
+        );
+      }
+
+      // metrics window
+      if (metricsWin && metricsWin.api_metrics) {
+        var am = metricsWin.api_metrics;
+        var en = metricsWin.entries || {};
+        rows.push(
+          '<div><b>Last 1h</b>: '
+          + 'requests ' + (am.request_count || 0).toLocaleString()
+          + ' &nbsp;·&nbsp; p50 ' + (am.latency_p50_ms || 0) + 'ms'
+          + ' &nbsp;·&nbsp; p95 ' + (am.latency_p95_ms || 0) + 'ms'
+          + ' &nbsp;·&nbsp; p99 ' + (am.latency_p99_ms || 0) + 'ms'
+          + ' &nbsp;·&nbsp; new entries ' + (en.total || 0)
+          + ' &nbsp;·&nbsp; sessions ' + (en.distinct_sessions || 0)
+          + ' &nbsp;<span style="color:var(--text-dim);">via /admin/metrics/window</span></div>'
+        );
+      }
+
+      // SKAP bootstrap summary
+      if (bootstrap && bootstrap.by_category) {
+        var parts = [];
+        Object.keys(bootstrap.by_category).sort().forEach(function(k) {
+          parts.push(k + ':' + bootstrap.by_category[k]);
+        });
+        rows.push(
+          '<div><b>SKAP shared-knowledge</b>: '
+          + (bootstrap.total_entries || 0) + ' entries ('
+          + parts.join(', ')
+          + ') &nbsp;·&nbsp; hash ' + ((bootstrap.content_hash || '').slice(7, 23) || '?')
+          + ' &nbsp;<span style="color:var(--text-dim);">via /aios/bootstrap</span></div>'
+        );
+      }
+
+      if (rows.length === 0) {
+        s45.innerHTML = '<div style="color:var(--text-muted);">No data (admin endpoints unreachable?)</div>';
+      } else {
+        rows.push(
+          '<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--bg-bar);font-size:11px;color:var(--text-dim);">'
+          + 'Endpoints shipped 2026-04-20: /admin/vacuum · /admin/auto-tune · /admin/snapshot · /admin/metrics/window · /admin/gc/dry-run · /admin/policy-check · /admin/db-size · /admin/kb-diff · /aios/bootstrap · /aios/mcp-manifest'
+          + '</div>'
+        );
+        s45.innerHTML = rows.join('');
+      }
+    }
+  } catch (e) {
+    var s45 = document.getElementById('stage45-content');
+    if (s45) s45.innerHTML = '<div style="color:var(--red);">render error: ' + (e.message || e) + '</div>';
   }
 }
 
