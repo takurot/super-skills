@@ -124,17 +124,35 @@ cc697e4  fix(watchdog): cold-boot grace + softer defaults
 - C9: depends on user H3 go on Option A vs B
 - Phase F (SKAP divergence detector): independent, can ship anytime
 
-**Priorities for 2026-04-21**:
-1. **Soak observation**: let SIGKILL-137 count stay flat 4-6 h.
-   If it doesn't, investigate before touching more code (the
-   morning cascade originated in exactly this class of miss).
-2. **C9 HITL decision**: ask user which option A vs B for
-   `buildRouteTable`. Spec recommends Option B (loopback ~2ms
-   cost, true P1). Once decided, ~80 LOC change with
-   `VCTX_ROUTE_TABLE_MODE=sqlite` fallback.
-3. **SKAP Phase F**: /admin/kb-diff. Guards against CLAUDE.md
-   drift from vcontext truth. Useful, optional, ~100 LOC.
-4. **LLM recovery**: only after C9 lands and SIGKILL is clean.
+**Priorities for 2026-04-21** (REVISED late-night 2026-04-20 after
+root-cause discovery — SIGKILL-137 still firing organically; see
+`docs/analysis/2026-04-20-nightly-organic-crash-pattern.md`):
+
+1. **FIRST — read the crash-pattern doc** (above). Evidence says
+   SIGKILL-137 chain is: mlx-embed retry storm → memory pressure
+   → SQLite mmap reclaim → "file is not a database" errors → OS
+   SIGKILL. Waiting alone will NOT achieve the 4-h soak condition.
+2. **C11 (new) — mlx-embed retry semantics patch**. Three
+   candidate changes documented in the crash-pattern doc §6:
+   - Exponential backoff on streak ≥ 3 failures
+   - Backlog-adaptive batch size (drop 16 → 4 when backlog > 5000)
+   - Circuit-breaker: 5 ECONNRESET / 60 s → mark unavailable for
+     5 min, store-path returns 202-accepted without embedding
+3. **C11 diagnostic** — wrap dbQuery() first-error-after-clean
+   to pragma integrity_check. Confirms/falsifies mmap-reclaim.
+4. **THEN — soak observation**. 4 h clean SIGKILL-137 → eligible
+   for LLM recovery.
+5. **C9 HITL decision** (can proceed in parallel with 1-4 since
+   it doesn't depend on embed retry): ask user which option A vs
+   B for `buildRouteTable`. Spec recommends Option B. Once
+   decided, ~80 LOC change with `VCTX_ROUTE_TABLE_MODE=sqlite`
+   fallback.
+6. **SKAP Phase F** (done 2026-04-20): /admin/kb-diff. Already
+   shipped as `92656ad`.
+7. **LLM recovery**: only after C11 patches + clean soak. The
+   `docs/analysis/2026-04-21-llm-recovery-spec.md` AC-R2 is NOT
+   passable without C11 first — enabling mlx-generate adds
+   memory pressure, not reduces it.
 
 ---
 
