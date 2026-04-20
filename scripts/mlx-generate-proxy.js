@@ -74,19 +74,45 @@ function logLine(...parts) {
 async function getFreePages() {
   try {
     const { stdout } = await execFileP('vm_stat', [], { timeout: 2000 });
-    // "Pages free:                                    12345."
-    const m = stdout.match(/Pages free:\s+(\d+)\./);
-    return m ? parseInt(m[1], 10) : null;
+    // 2026-04-20 fix: on macOS, "Pages free" alone is misleading.
+    // The kernel aggressively keeps pages in the "inactive" state as
+    // file-system cache — reclaimable on demand without causing memory
+    // pressure. On a busy workstation "Pages free" is routinely
+    // 3000-10000 (50-160 MB) while "Pages inactive" holds 600000+
+    // pages (10 GB) of reclaimable cache. Gating on `free` alone
+    // refuses MLX warm-up even when 10 GB is genuinely available.
+    //
+    // Correct metric: free + inactive = available-without-swapping.
+    // True memory pressure (when we should refuse) shows as BOTH
+    // dropping simultaneously, because the kernel reclaims inactive
+    // → free when allocations stress it.
+    //
+    // Observed 2026-04-20: vm_stat free=9990 inactive=660000 was
+    // rejected by the pre-fix gate (9990 < 50000) even though
+    // 10+ GB was actually available. Direct :3162 call succeeded
+    // with no SIGKILL-137, proving the rejection was a false
+    // positive.
+    const mFree = stdout.match(/Pages free:\s+(\d+)\./);
+    const mInactive = stdout.match(/Pages inactive:\s+(\d+)\./);
+    const free = mFree ? parseInt(mFree[1], 10) : 0;
+    const inactive = mInactive ? parseInt(mInactive[1], 10) : 0;
+    if (!mFree && !mInactive) return null; // parse failed entirely
+    return free + inactive;
   } catch {
     return null;
   }
 }
 
 /**
- * If the system has less than MIN_FREE_PAGES of free memory, loading the
- * 8B model (~6 GB) would trigger jetsam and kill innocent bystanders
- * (vcontext, mlx-embed). Return 503 in that case, mirroring the
- * watchdog's MLX_RESTART_MIN_FREE_PAGES policy. Same constant on purpose.
+ * If the system has less than MIN_FREE_PAGES of AVAILABLE memory
+ * (free + inactive), loading the 8B model (~6 GB) would trigger
+ * jetsam and kill innocent bystanders (vcontext, mlx-embed).
+ * Return 503 in that case, mirroring the watchdog's
+ * MLX_RESTART_MIN_FREE_PAGES policy. Same constant on purpose.
+ *
+ * Semantics note: getFreePages() returns free+inactive as of
+ * 2026-04-20. MIN_FREE_PAGES=50000 = 800 MB of available memory
+ * for MLX warm-up headroom.
  */
 async function memoryGate() {
   const free = await getFreePages();
@@ -191,6 +217,24 @@ async function startMlx() {
       const err = new Error(`memory_tight: free=${memCheck.free} < min=${MIN_FREE_PAGES}`);
       err.status = 503;
       throw err;
+    }
+
+    // 2026-04-20 fix: skip bootstrap when service is ALREADY running.
+    // Proxy's normal flow assumes MLX is STOPPED (it tracks the state
+    // itself via bootouts), so `launchctl bootstrap` is called blindly.
+    // But if MLX was started by an out-of-band actor (manual
+    // `launchctl enable+kickstart`, watchdog, operator tests), bootstrap
+    // returns "service already loaded" → proxy throws bootstrap_failed
+    // and refuses traffic even though the model IS responding on :3162.
+    //
+    // Fix: probe /v1/models first. If MLX is healthy, fast-path to
+    // RUNNING without touching launchctl. Only bootstrap when we
+    // genuinely need to start it.
+    if (await mlxIsHealthy()) {
+      logLine('MLX already healthy on :3162 — skipping bootstrap');
+      state.value = 'RUNNING';
+      state.warm_up_ms_last = 0;
+      return;
     }
 
     logLine('MLX starting: launchctl enable + bootstrap');
