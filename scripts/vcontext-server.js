@@ -3465,6 +3465,30 @@ async function startEmbedLoop() {
     return 30000;                // 4+: 30s (give MLX time to recover)
   };
 
+  // C11 D3 (2026-04-20): circuit breaker.
+  // When mlx-embed is unresponsive and backoff hits 30s, the loop still
+  // holds 16 × 16 KB request buffers each iteration. 20 iterations over
+  // 10 min = 5 MB * retry cycles = memory pressure that triggers OS
+  // mmap reclaim of SQLite pages (→ "file is not a database" cascade →
+  // SIGKILL-137; root cause per docs/analysis/2026-04-20-nightly-
+  // organic-crash-pattern.md).
+  //
+  // When consecutiveFailures >= C11_CIRCUIT_OPEN_STREAK (3), open the
+  // circuit for C11_CIRCUIT_OPEN_MS (120 s). During that window, skip
+  // the MLX call entirely — no request buffers allocated, no retry
+  // storm. After the window, allow ONE probe batch; on success, reset
+  // the streak (closes circuit).
+  //
+  // Rollback: VCTX_EMBED_C11_DISABLED=1 skips the circuit check,
+  // reverting to today's unconditional-retry behavior.
+  let circuitOpenUntil = 0;
+  const C11_CIRCUIT_OPEN_MS = 120_000;
+  const C11_CIRCUIT_OPEN_STREAK = 3;
+  const C11_DISABLED = process.env.VCTX_EMBED_C11_DISABLED === '1';
+  if (!C11_DISABLED) {
+    console.log('[embed-loop] C11 active: batch timeout=60s, circuit-breaker on streak>=3 (VCTX_EMBED_C11_DISABLED=1 to revert)');
+  }
+
   while (embedLoopRunning) {
     _loopHeartbeat.embed = Date.now();
     _loopHeartbeat.embed_iter++;
@@ -3484,6 +3508,15 @@ async function startEmbedLoop() {
     // Pause if flag file exists
     if (existsSync('/tmp/vcontext-embed-pause')) {
       await new Promise(r => setTimeout(r, 60000));
+      continue;
+    }
+
+    // C11 D3: circuit-open check. During the 120s window we neither
+    // call MLX nor allocate request buffers — the loop essentially
+    // idles, letting MLX (or the OS memory pressure it's contributing
+    // to) recover.
+    if (!C11_DISABLED && Date.now() < circuitOpenUntil) {
+      await new Promise(r => setTimeout(r, 30000));  // wake every 30s to recheck
       continue;
     }
     try {
@@ -3556,13 +3589,22 @@ async function startEmbedLoop() {
           try { vecUpsert(rows[i].id, emb); } catch {}
           try { dbExec(`UPDATE entry_index SET has_embedding = 1 WHERE entry_id = ${rows[i].id};`); } catch {}
         }
-        // Success — reset backoff.
+        // Success — reset backoff + close circuit if it was open.
         if (consecutiveFailures > 0) {
           console.log(`[embed-loop] recovered after ${consecutiveFailures} consecutive failures`);
           consecutiveFailures = 0;
         }
+        if (!C11_DISABLED && circuitOpenUntil > 0) {
+          console.log('[embed-loop] circuit CLOSED — MLX embed recovered');
+          circuitOpenUntil = 0;
+        }
       } else if (batchFailed) {
         consecutiveFailures++;
+        // C11 D3: open circuit when streak crosses threshold.
+        if (!C11_DISABLED && consecutiveFailures >= C11_CIRCUIT_OPEN_STREAK && circuitOpenUntil === 0) {
+          circuitOpenUntil = Date.now() + C11_CIRCUIT_OPEN_MS;
+          console.log(`[embed-loop] circuit OPEN for ${C11_CIRCUIT_OPEN_MS/1000}s (streak=${consecutiveFailures}) — pausing MLX calls to reduce memory pressure`);
+        }
       } else if (embeddings && embeddings.length !== rows.length) {
         // 2026-04-20 review cleanup: if MLX returns a mismatched-length
         // array silently (well-formed JSON, wrong count), we'd previously
@@ -3572,6 +3614,11 @@ async function startEmbedLoop() {
         batchFailed = true;
         consecutiveFailures++;
         console.log(`[embed-loop] mismatched response length (got ${embeddings.length}, expected ${rows.length}) — treating as failure`);
+        // C11 D3: same circuit-open logic as ECONNRESET path.
+        if (!C11_DISABLED && consecutiveFailures >= C11_CIRCUIT_OPEN_STREAK && circuitOpenUntil === 0) {
+          circuitOpenUntil = Date.now() + C11_CIRCUIT_OPEN_MS;
+          console.log(`[embed-loop] circuit OPEN for ${C11_CIRCUIT_OPEN_MS/1000}s (streak=${consecutiveFailures}) — pausing MLX calls to reduce memory pressure`);
+        }
       }
       // Adaptive gap: 100ms healthy, up to 30s after 4+ failures.
       await new Promise(r => setTimeout(r, backoffMs(consecutiveFailures)));
@@ -5241,14 +5288,27 @@ async function mlxEmbedFast(text, timeoutMs = 2000) {
 }
 
 // Batch embed via /embed_batch (10x throughput vs single calls)
-function _mlxEmbedBatchRaw(texts) {
+function _mlxEmbedBatchRaw(texts, timeoutMs) {
+  // C11 D1 (2026-04-20): default timeout 600_000ms → 60_000ms.
+  // The 10-minute default held up to 16 × 16 KB of content + embedding
+  // buffers for up to 10 min per stalled batch. That retention window
+  // was the main memory-pressure source causing mmap page reclamation
+  // (docs/analysis/2026-04-20-nightly-organic-crash-pattern.md §4b).
+  // MLX embed p99 is ~2s on healthy runs; a batch taking >60s is
+  // already pathological. Fail-fast frees the buffers + lets the retry
+  // loop cycle the circuit breaker (D3) sooner.
+  //
+  // Rollback: VCTX_EMBED_C11_DISABLED=1 keeps the pre-C11 10-min value.
+  if (timeoutMs === undefined) {
+    timeoutMs = (process.env.VCTX_EMBED_C11_DISABLED === '1') ? 600_000 : 60_000;
+  }
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ texts: texts.map(sanitizeEmbedText), model: MLX_DEFAULT_MODEL, normalize: true });
     const parsed = new URL(`${MLX_EMBED_URL}/embed_batch`);
     const req = httpRequest(parsed, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-      timeout: 600000, // 10min
+      timeout: timeoutMs,
     }, (res) => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
