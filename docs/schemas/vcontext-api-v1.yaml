@@ -2092,7 +2092,19 @@ paths:
     post:
       tags: [admin]
       operationId: verifyBackup
-      summary: Integrity check of latest N snapshots
+      summary: Integrity check of latest N snapshots (offloaded to worker_thread — Stage 4.5 C5)
+      description: |
+        Iterates up to 10 most recent snapshots under
+        ~/skills/data/snapshots/, opening each with better-sqlite3 and
+        running PRAGMA integrity_check + COUNT(*) + schema probe.
+
+        Stage 4.5 C5 fix: the verification loop runs in a worker_thread
+        (scripts/workers/verify-snapshot.mjs) so the main event loop
+        stays free during what used to be a ~20 s stall on 10× 6.7 GB
+        snapshots. Satisfies AC-4 (concurrent /health p99 < 50 ms).
+
+        In-flight guard: 429 status=busy reason=verify_already_running
+        if another verify is still running.
       responses:
         '200':
           description: Verification result
@@ -2109,11 +2121,22 @@ paths:
                   alerts: { type: array, items: { type: string } }
                   snapshots: { type: array, items: { type: object } }
                   verified_at: { type: string }
+                  offloaded_to_worker: { type: boolean, description: 'true since C5' }
         '404':
           description: No snapshots found
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '429':
+          description: Another verify already running (in-flight guard)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [busy] }
+                  reason: { type: string, enum: [verify_already_running] }
+                  hint: { type: string }
 
   /admin/trigger-l2-summary:
     post:

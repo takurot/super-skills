@@ -6807,46 +6807,85 @@ const server = createServer(async (req, res) => {
         sendJson(res, 200, { ram_deleted: r.changes, ssd_deleted: ssdR.changes, userId });
       } catch (e) { sendJson(res, 500, { error: e.message }); }
     } else if (method === 'POST' && path === '/admin/verify-backup') {
-      // Comprehensive backup verification:
-      // 1. ALL snapshots integrity_check
-      // 2. Latest snapshot: entry count + sample read + schema check
-      // 3. Size & age validation
+      // Stage 4.5 Commit C5 (spec §3.2.x "verify-snapshot", AC-4).
+      //
+      // Previously this handler ran PRAGMA integrity_check + COUNT(*)
+      // inline in a for-loop across up to 10 snapshots. On the 6.7 GB
+      // primary, each integrity_check blocks Node's event loop for
+      // multi-seconds, and 10× accumulated to ~20 s during which /health
+      // could not respond. AC-4 mandates p99 < 50 ms concurrent /health
+      // while this endpoint is running.
+      //
+      // Fix: offload the verification loop to a worker_thread
+      // (scripts/workers/verify-snapshot.mjs). The worker gets its own
+      // thread, opens snapshot databases with better-sqlite3 there, and
+      // posts the aggregated result back. The main thread awaits a
+      // Promise that resolves on worker 'message' — so readBody /
+      // ramDb ops / concurrent /health remain fully responsive.
+      //
+      // In-flight guard prevents two parallel verifies (each worker
+      // opens 10 SQLite files, fighting for page cache).
       try {
         const SNAP_DIR = join(BACKUP_DIR, 'snapshots');
         const fs = require('node:fs');
-        const files = fs.readdirSync(SNAP_DIR).filter(f => f.endsWith('.db')).sort().reverse();
-        if (files.length === 0) return sendJson(res, 404, { error: 'no snapshots found' });
+        try { fs.accessSync(SNAP_DIR); } catch {
+          return sendJson(res, 404, { error: 'no snapshots dir' });
+        }
 
-        const results = [];
-        for (const f of files.slice(0, 10)) { // check last 10 snapshots
-          const fullPath = join(SNAP_DIR, f);
-          const stat = fs.statSync(fullPath);
-          const ageHours = (Date.now() - stat.mtimeMs) / 1000 / 3600;
-          let integrity = 'unknown', entryCount = 0, schemaOk = false;
-          try {
-            const probe = new Database(fullPath, { readonly: true });
-            try {
-              const ok = probe.prepare('PRAGMA integrity_check').get();
-              integrity = ok.integrity_check === 'ok' ? 'ok' : ok.integrity_check;
-              const cnt = probe.prepare('SELECT COUNT(*) as c FROM entries').get();
-              entryCount = cnt.c;
-              // Schema check — verify required tables exist
-              const tables = probe.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all().map(r => r.name);
-              schemaOk = tables.includes('entries') && tables.includes('entries_fts');
-            } finally { probe.close(); }
-          } catch (e) { integrity = 'error: ' + e.message.slice(0, 50); }
-          results.push({
-            snapshot: f,
-            size_mb: Math.round(stat.size / 1024 / 1024),
-            age_hours: Math.round(ageHours * 10) / 10,
-            integrity,
-            entry_count: entryCount,
-            schema_ok: schemaOk,
-            status: (integrity === 'ok' && schemaOk) ? 'pass' : 'fail',
+        if (globalThis._verifyBackupInFlight) {
+          return sendJson(res, 429, {
+            status: 'busy',
+            reason: 'verify_already_running',
+            hint: 'wait for current verify-backup to complete',
           });
         }
 
-        const failed = results.filter(r => r.status === 'fail');
+        globalThis._verifyBackupInFlight = true;
+        let workerResult;
+        try {
+          const { Worker } = require('node:worker_threads');
+          const pathMod = require('node:path');
+          const workerPath = pathMod.join(
+            process.env.HOME, 'skills', 'scripts', 'workers', 'verify-snapshot.mjs'
+          );
+
+          workerResult = await new Promise((resolve, reject) => {
+            const worker = new Worker(workerPath, {
+              workerData: { snapDir: SNAP_DIR, maxFiles: 10 },
+            });
+            let settled = false;
+            worker.on('message', (msg) => {
+              if (settled) return;
+              settled = true;
+              resolve(msg);
+              worker.terminate().catch(() => {});
+            });
+            worker.on('error', (err) => {
+              if (settled) return;
+              settled = true;
+              reject(err);
+            });
+            worker.on('exit', (code) => {
+              if (settled) return;
+              settled = true;
+              reject(new Error(`worker exited with code ${code}`));
+            });
+          });
+        } finally {
+          globalThis._verifyBackupInFlight = false;
+        }
+
+        if (!workerResult || workerResult.ok !== true) {
+          return sendJson(res, 500, {
+            error: workerResult?.error || 'worker returned no result',
+          });
+        }
+        const results = workerResult.results || [];
+        if (results.length === 0) {
+          return sendJson(res, 404, { error: 'no snapshots found' });
+        }
+
+        const failed = results.filter((r) => r.status === 'fail');
         const latest = results[0] || {};
         const alerts = [];
         if (failed.length > 0) alerts.push(`${failed.length} snapshot(s) failed verification`);
@@ -6862,6 +6901,7 @@ const server = createServer(async (req, res) => {
           alerts,
           snapshots: results,
           verified_at: new Date().toISOString(),
+          offloaded_to_worker: true,
         });
       } catch (e) { sendJson(res, 500, { error: e.message }); }
     } else if (method === 'GET' && path === '/admin/pending-patches') {
