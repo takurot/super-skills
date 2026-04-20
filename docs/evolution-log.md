@@ -836,3 +836,23 @@ write-through + JSONL log + multiple snapshots).
 - Discovery: 20 searches | Suggestions: 71 | Skills created: 76
 - Embedding: 25632/34899 | Sessions: 62
 - Upstream: 0 commits behind
+
+## 2026-04-18 — evolution-cycle 2026-16
+
+**Type**: evolution-cycle (weekly scheduled)
+**Weights used**: w1=0.25, w2=0.25, w3=0.2, w4=0.2, w5=0.1
+**Candidates gathered**: total=0, by source={}
+**Top-K scored**: 0
+**Pending-patches emitted**: 0
+**Observation mode**: yes
+**Notes**: observation mode: Phase (c)-(e) skipped
+
+## 2026-04-19 — evolution-cycle 2026-16
+
+**Type**: evolution-cycle (weekly scheduled)
+**Weights used**: w1=0.25, w2=0.25, w3=0.2, w4=0.2, w5=0.1
+**Candidates gathered**: total=0, by source={}
+**Top-K scored**: 0
+**Pending-patches emitted**: 0
+**Observation mode**: yes
+**Notes**: observation mode: Phase (c)-(e) skipped
