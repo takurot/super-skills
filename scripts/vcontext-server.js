@@ -569,6 +569,22 @@ function migrateRamSchema() {
     dbExec("ANALYZE;");
   } catch {}
 
+  // Stage 4.5 C10 hygiene: one-shot cleanup of rows where `content` was
+  // coerced from a JavaScript object to the literal string
+  // "[object Object]" prior to the C10 input validator. These rows are
+  // useless (content is not recoverable), break MLX embed (.slice
+  // throws), and poison FTS. Delete all at boot; idempotent (no rows
+  // to delete on normal boots).
+  try {
+    const badCount = dbQuery(
+      `SELECT COUNT(*) AS n FROM entries WHERE content = '[object Object]'`
+    )?.[0]?.n | 0;
+    if (badCount > 0) {
+      dbExec(`DELETE FROM entries WHERE content = '[object Object]'`);
+      console.log(`[vcontext:c10] Deleted ${badCount} row(s) with content='[object Object]' (pre-C10 coercion artifact)`);
+    }
+  } catch { /* non-fatal */ }
+
   // Add tiered-storage columns if they do not already exist.
   // SQLite does not support ADD COLUMN IF NOT EXISTS, so we check
   // the table_info pragma first.
@@ -1416,6 +1432,22 @@ async function handleStore(req, res) {
   }
   if (!isValidType(type)) {
     return sendJson(res, 400, { error: 'Invalid type. Must be a non-empty string.' });
+  }
+  // Stage 4.5 C10: content-type strict validation.
+  // Pre-C10, callers passing a JavaScript object as `content` (e.g. a
+  // typed proposal body) silently got "[object Object]" stored because
+  // the SQLite bind path coerces via String(content). That then broke
+  // MLX embed (content.slice is not a function) and poisoned the FTS
+  // index. As of C10, `content` must be a string — reject with 400
+  // so the client re-serializes deliberately.
+  if (typeof content !== 'string') {
+    return sendJson(res, 400, {
+      error: 'content must be a string. Pre-serialize objects via JSON.stringify before POST /store.',
+      received_type: typeof content,
+    });
+  }
+  if (content.length === 0) {
+    return sendJson(res, 400, { error: 'content must be non-empty string.' });
   }
 
   // Global dedup via content_hash + UNIQUE index (atomic, race-free).
