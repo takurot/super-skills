@@ -1446,9 +1446,12 @@ async function recordEvent(eventName, preReadInput) {
           }).catch(() => {});
         }
       }
-      if (prompt.length >= 15) {
-        post('/predictive-search', { prompt: prompt.slice(0, 500), session: sessionId }).catch(() => {});
-      }
+      // 2026-04-21 dedup: predictive-search POST removed here.
+      // handleUserPrompt (L1745) fires it — keeping one specific call
+      // instead of duplicating in generic recordEvent. Agent ad177f1f
+      // traced duplicate "handler entered, prompt_len=N" log pattern
+      // to both this line and L1745 firing per user-prompt event.
+      // Removing this half cuts /predictive-search rate by 50%.
 
       // Working-state: record per-turn what the user is working on + where.
       // Enables continuation across account/session switches in the same cwd.
