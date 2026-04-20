@@ -6609,6 +6609,7 @@ const ENDPOINTS_LIST = [
   'POST   /admin/policy-check       — run policy checks (secret-scan, tier-balance, policy-violations) {checks?:[...],window_hours?:N}',
   'GET    /aios/bootstrap           — SKAP v1: shared-knowledge bootstrap for cross-AI clients ?categories=&since=&limit=&format=json|system-prompt (ETag + 304 supported)',
   'GET    /admin/db-size            — primary DB size via PRAGMA page_size/page_count + on-disk file stat',
+  'GET    /aios/mcp-manifest        — SKAP v1 Phase C: MCP-compatible tool manifest (4 tools: recall lessons/decisions/design-proposals + store-lesson)',
 ];
 
 const server = createServer(async (req, res) => {
@@ -8872,6 +8873,156 @@ const server = createServer(async (req, res) => {
         });
       } catch (e) {
         sendJson(res, 500, { status: 'fail', error: e.message });
+      }
+    } else if (method === 'GET' && path === '/aios/mcp-manifest') {
+      // SKAP Phase C (spec §4.3). Publishes the tool definitions for
+      // MCP-compatible AI clients (Claude Desktop / Codex CLI /
+      // Gemini / any Model-Context-Protocol host). The client fetches
+      // this URL, registers the 3 tools, and can then call them by
+      // name without any custom HTTP glue.
+      //
+      // NOTE: this is a *manifest* publisher, not an MCP server
+      // transport (no stdio/SSE here). Hosts that proxy MCP over
+      // HTTP can consume the manifest directly. For full MCP stdio
+      // support we'd need a separate bridge process (Phase E+).
+      //
+      // Publicly readable — no admin header required. The tool
+      // invocation itself (aios_store_lesson) is write-gated on the
+      // existing /store endpoint which enforces API-key + member role.
+      if (method === 'GET' && req.headers['accept']
+          && req.headers['accept'].includes('application/problem+json')) {
+        // future: content negotiation; for now default to JSON
+      }
+      try {
+        const baseUrl = `http://${req.headers.host || '127.0.0.1:3150'}`;
+        const manifest = {
+          version: 'skap-1',
+          source: 'aios-mcp-manifest',
+          base_url: baseUrl,
+          description:
+            'AIOS shared-knowledge tool suite. Call aios_recall_* at ' +
+            'session start to retrieve cross-session patterns (failure ' +
+            'lessons, decisions, design proposals). aios_store_lesson ' +
+            'persists new findings; it is HITL-gated — clients must ' +
+            'prompt the user before invoking.',
+          tools: [
+            {
+              name: 'aios_recall_lessons',
+              description:
+                'Retrieve failure-pattern lesson-learned entries from AIOS. Call at session start or when about to make a claim you\'re not certain about. Returns categorized rules with ids.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  category: {
+                    type: 'string',
+                    enum: ['evidence-before-claim', 'session-handoff', 'architecture', 'other'],
+                    description: 'Category tag to filter by. Omit for all.',
+                  },
+                  limit: { type: 'integer', default: 20, minimum: 1, maximum: 200 },
+                  since: { type: 'string', format: 'date', description: 'ISO date floor' },
+                },
+                additionalProperties: false,
+              },
+              resolves_to: {
+                method: 'GET',
+                url: `${baseUrl}/aios/bootstrap?categories=lesson-learned`,
+                auth: 'X-Vcontext-Admin: yes',
+                response_field: 'entries[]',
+              },
+            },
+            {
+              name: 'aios_recall_decisions',
+              description:
+                'Retrieve architectural / operational decisions shared across AIOS. Each decision is a JSON-serialized string in the entry content field; parse and respect status=active.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  since: { type: 'string', format: 'date' },
+                  limit: { type: 'integer', default: 50, minimum: 1, maximum: 500 },
+                },
+                additionalProperties: false,
+              },
+              resolves_to: {
+                method: 'GET',
+                url: `${baseUrl}/aios/bootstrap?categories=decision`,
+                auth: 'X-Vcontext-Admin: yes',
+                response_field: 'entries[]',
+              },
+            },
+            {
+              name: 'aios_recall_design_proposals',
+              description:
+                'Retrieve active design proposals awaiting review. Useful before proposing changes in the same area — avoids duplicate proposals.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  limit: { type: 'integer', default: 20, minimum: 1, maximum: 200 },
+                },
+                additionalProperties: false,
+              },
+              resolves_to: {
+                method: 'GET',
+                url: `${baseUrl}/aios/bootstrap?categories=design-proposal`,
+                auth: 'X-Vcontext-Admin: yes',
+                response_field: 'entries[]',
+              },
+            },
+            {
+              name: 'aios_store_lesson',
+              description:
+                'Post a new lesson-learned entry. The content field MUST be a JSON-serialized string (not a raw object) — use JSON.stringify client-side. The tags array MUST include at least one category tag (e.g. "evidence-before-claim"). HITL: clients should ask the user to confirm before invoking.',
+              write_gate: 'user-confirmation-required',
+              inputSchema: {
+                type: 'object',
+                required: ['content', 'tags'],
+                properties: {
+                  content: {
+                    type: 'string',
+                    minLength: 1,
+                    description:
+                      'JSON-serialized lesson. Must parse as object with at least {pattern_id, title, rule}.',
+                  },
+                  tags: {
+                    type: 'array',
+                    minItems: 1,
+                    items: { type: 'string', pattern: '^[a-zA-Z0-9_-]{1,64}$' },
+                  },
+                  session: {
+                    type: 'string',
+                    default: 'aios-shared-knowledge',
+                    enum: ['aios-shared-knowledge'],
+                  },
+                },
+                additionalProperties: false,
+              },
+              resolves_to: {
+                method: 'POST',
+                url: `${baseUrl}/store`,
+                auth: 'API-key member-or-above',
+                body_template: {
+                  type: 'lesson-learned',
+                  session: 'aios-shared-knowledge',
+                  tags: '{{inputs.tags}}',
+                  content: '{{inputs.content}}',
+                },
+              },
+            },
+          ],
+          notes: [
+            'Manifest follows SKAP v1 conventions, not the official MCP schema transport. An MCP-bridge process (Phase E) can translate this into stdio/SSE on demand.',
+            'content MUST be a JSON-serialized string per C10 hardening — the server rejects typeof content !== "string" with 400.',
+            'Cross-machine access: set up a Tailscale tunnel (see docs/runbooks/skap-tailscale.md once Phase D lands); pass the X-Vcontext-Admin header through.',
+          ],
+          source_of_truth: `${baseUrl}/aios/bootstrap`,
+          generated_at: new Date().toISOString(),
+        };
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'public, max-age=300',
+        });
+        res.end(JSON.stringify(manifest));
+      } catch (e) {
+        sendJson(res, 500, { error: e.message });
       }
     } else if (method === 'GET' && path === '/admin/db-size') {
       // Stage 4.5 C7b (spec follow-up). Small read-only helper that
