@@ -6607,6 +6607,7 @@ const ENDPOINTS_LIST = [
   'GET    /admin/metrics/window     — aggregate api_metrics + entries stats ?hours=N&metric=all|api_metrics|entries|latency_*  (hours 1..720)',
   'POST   /admin/gc/dry-run         — report GC candidates (read-only) {embedding_prune_days?:N,include_types?:[...]}',
   'POST   /admin/policy-check       — run policy checks (secret-scan, tier-balance, policy-violations) {checks?:[...],window_hours?:N}',
+  'GET    /aios/bootstrap           — SKAP v1: shared-knowledge bootstrap for cross-AI clients ?categories=&since=&limit=&format=json|system-prompt (ETag + 304 supported)',
 ];
 
 const server = createServer(async (req, res) => {
@@ -8870,6 +8871,168 @@ const server = createServer(async (req, res) => {
         });
       } catch (e) {
         sendJson(res, 500, { status: 'fail', error: e.message });
+      }
+    } else if (method === 'GET' && path === '/aios/bootstrap') {
+      // SKAP Phase A (docs/specs/2026-04-21-aios-shared-knowledge-
+      // access-protocol.md §4.1). Returns AIOS-wide shared knowledge
+      // for cross-AI consumption. Unlike /recall this is tightly
+      // scoped (only shared-knowledge categories), has a stable
+      // content_hash + ETag for cacheable bootstrap, and supports
+      // format=system-prompt for direct system-prompt injection.
+      //
+      // Primary motivating use case (user 2026-04-20): Gemini / Codex /
+      // a second Claude on another machine should be able to pull the
+      // same 4 lesson-learned + 1 design-proposal that this session
+      // posted, without needing CLAUDE.md access.
+      //
+      // Query:
+      //   categories=lesson-learned,decision,design-proposal  (CSV, default = all 3)
+      //   since=2026-04-01                                    (ISO date, optional)
+      //   limit=200                                           (hard max 500)
+      //   format=json|system-prompt                           (default json)
+      //
+      // Caching:
+      //   - ETag stable across requests with same content
+      //   - If-None-Match matching → 304
+      if (req.headers['x-vcontext-admin'] !== 'yes') {
+        return sendJson(res, 403, {
+          error: 'X-Vcontext-Admin: yes header required',
+        });
+      }
+      try {
+        if (!ramDb) {
+          return sendJson(res, 503, { status: 'skipped', reason: 'ramdb_unavailable' });
+        }
+        const params = parseQuery(req.url);
+        const ALLOWED_CATS = ['lesson-learned', 'decision', 'design-proposal'];
+        let categories = ALLOWED_CATS;
+        if (typeof params.categories === 'string' && params.categories.length > 0) {
+          categories = params.categories.split(',')
+            .map(s => s.trim())
+            .filter(c => ALLOWED_CATS.includes(c));
+          if (categories.length === 0) {
+            return sendJson(res, 400, {
+              error: 'Invalid categories. Must be CSV subset of: ' + ALLOWED_CATS.join(','),
+            });
+          }
+        }
+        const since = (typeof params.since === 'string' && /^\d{4}-\d{2}-\d{2}/.test(params.since))
+          ? params.since : null;
+        const limitRaw = parseInt(params.limit || '200', 10);
+        const limit = Number.isFinite(limitRaw)
+          ? Math.max(1, Math.min(500, limitRaw))
+          : 200;
+        const format = params.format === 'system-prompt' ? 'system-prompt' : 'json';
+
+        // Scope to shared-knowledge sessions:
+        //   aios-shared-knowledge   — lesson-learned + decision
+        //   aios-design-proposals   — design-proposal (active only)
+        // Mixing with per-session-UUID entries would leak session data.
+        const SHARED_SESSIONS = ['aios-shared-knowledge', 'aios-design-proposals'];
+        const placeholders = categories.map(() => '?').join(',');
+        const sessPlaceholders = SHARED_SESSIONS.map(() => '?').join(',');
+        let sql = `SELECT id, type, session, tags, content, created_at, content_hash
+                   FROM entries
+                   WHERE type IN (${placeholders})
+                     AND session IN (${sessPlaceholders})
+                     AND (status IS NULL OR status = 'active')
+                     AND (supersedes IS NULL)`;
+        const args = [...categories, ...SHARED_SESSIONS];
+        if (since) { sql += ` AND created_at >= ?`; args.push(since + 'T00:00:00'); }
+        sql += ` ORDER BY id DESC LIMIT ?`;
+        args.push(limit);
+
+        let rows = [];
+        try { rows = ramDb.prepare(sql).all(...args); } catch { rows = []; }
+
+        const byCategory = {};
+        for (const r of rows) byCategory[r.type] = (byCategory[r.type] || 0) + 1;
+
+        // Build a stable hash over entries (ids + content_hashes).
+        const hashInput = rows.map(r => `${r.id}:${r.content_hash || ''}`).join('|');
+        const contentHash = 'sha256:' + require('node:crypto')
+          .createHash('sha256').update(hashInput).digest('hex');
+        const etag = `"${contentHash.slice(7, 23)}"`;
+
+        // Conditional GET (304).
+        const ifNoneMatch = req.headers['if-none-match'];
+        if (ifNoneMatch && ifNoneMatch === etag) {
+          res.writeHead(304, {
+            'ETag': etag,
+            'Cache-Control': 'private, max-age=60',
+          });
+          res.end();
+          return;
+        }
+
+        const generated_at = new Date().toISOString();
+
+        if (format === 'system-prompt') {
+          // Markdown rendering, size-capped at 16 KB.
+          const lines = [];
+          lines.push(`## AIOS Shared Knowledge (SKAP v1 bootstrap)`);
+          lines.push('');
+          lines.push(`Retrieved ${generated_at}, content_hash ${contentHash}`);
+          lines.push(`Entries: ${rows.length} (${Object.entries(byCategory).map(([k,v])=>k+':'+v).join(', ')})`);
+          lines.push('');
+          const byType = {};
+          for (const r of rows) (byType[r.type] = byType[r.type] || []).push(r);
+          const TYPE_ORDER = ['lesson-learned', 'decision', 'design-proposal'];
+          for (const t of TYPE_ORDER) {
+            if (!byType[t] || byType[t].length === 0) continue;
+            lines.push(`### ${t} (${byType[t].length})`);
+            for (const r of byType[t]) {
+              // Extract short title from content — try JSON, else first line.
+              let title = '';
+              try {
+                const parsed = JSON.parse(r.content);
+                title = parsed.title || parsed.rule || parsed.pattern_id || parsed.proposal_id || '';
+              } catch {
+                title = String(r.content || '').split('\n')[0].slice(0, 100);
+              }
+              lines.push(`- [id=${r.id}] ${title || '(no title)'}`);
+            }
+            lines.push('');
+          }
+          lines.push(`_source of truth: vcontext entries at ${process.env.HOSTNAME || 'localhost'}:3150 — see docs/principles/shared-knowledge-source-of-truth.md_`);
+          let md = lines.join('\n');
+          const CAP = 16 * 1024;
+          if (md.length > CAP) {
+            md = md.slice(0, CAP - 100) + '\n\n… (truncated, see /aios/bootstrap?format=json for full set)';
+          }
+          res.writeHead(200, {
+            'Content-Type': 'text/markdown; charset=utf-8',
+            'ETag': etag,
+            'Cache-Control': 'private, max-age=60',
+          });
+          res.end(md);
+          return;
+        }
+
+        // Default: JSON response.
+        const body = {
+          version: 'skap-1',
+          generated_at,
+          content_hash: contentHash,
+          total_entries: rows.length,
+          by_category: byCategory,
+          entries: rows.map(r => ({
+            id: r.id,
+            type: r.type,
+            session: r.session,
+            tags: (() => { try { return JSON.parse(r.tags || '[]'); } catch { return []; } })(),
+            created_at: r.created_at,
+            content: r.content,
+          })),
+        };
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'ETag': etag,
+          'Cache-Control': 'private, max-age=60',
+        });
+        res.end(JSON.stringify(body));
+      } catch (e) {
+        sendJson(res, 500, { error: e.message });
       }
     } else if (method === 'POST' && path === '/admin/fts-full-rebuild') {
       // Nuclear rebuild: drop FTS + triggers, recreate, reindex from entries,

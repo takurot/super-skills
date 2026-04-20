@@ -2723,6 +2723,97 @@ paths:
         '503':
           description: ramdb_unavailable.
 
+  /aios/bootstrap:
+    get:
+      tags: [aios]
+      operationId: aiosBootstrap
+      summary: SKAP v1 — shared-knowledge bootstrap for cross-AI consumption
+      description: |
+        Returns the AIOS-wide shared knowledge set (lesson-learned,
+        decision, design-proposal) in a stable, cacheable format.
+        Consumed by any AI client (Claude Code SessionStart hook,
+        Gemini/Codex via MCP, second Claude on another machine) at
+        session start to warm its context with shared patterns.
+
+        Spec: docs/specs/2026-04-21-aios-shared-knowledge-access-
+        protocol.md §4.1.
+
+        Scope: entries with type IN (lesson-learned, decision,
+        design-proposal) AND session IN (aios-shared-knowledge,
+        aios-design-proposals) AND (status IS NULL OR status='active')
+        AND supersedes IS NULL. Per-session-UUID entries are
+        deliberately excluded to prevent session-data leakage.
+
+        Supports ETag/If-None-Match for cache-friendly polling.
+      security:
+        - AdminHeader: []
+      parameters:
+        - in: header
+          name: X-Vcontext-Admin
+          required: true
+          schema: { type: string, enum: [yes] }
+        - in: query
+          name: categories
+          description: 'CSV of categories. Subset of: lesson-learned,decision,design-proposal. Default all three.'
+          schema: { type: string }
+        - in: query
+          name: since
+          description: 'ISO date (YYYY-MM-DD). Return only entries created at or after.'
+          schema: { type: string, format: date }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 200 }
+        - in: query
+          name: format
+          schema: { type: string, enum: [json, system-prompt], default: json }
+        - in: header
+          name: If-None-Match
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Shared-knowledge bootstrap payload.
+          headers:
+            ETag: { schema: { type: string }, description: 'Stable hash over ids + content_hashes' }
+            Cache-Control: { schema: { type: string }, description: 'private, max-age=60' }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string, enum: [skap-1] }
+                  generated_at: { type: string, format: date-time }
+                  content_hash: { type: string, description: 'sha256: prefix' }
+                  total_entries: { type: integer }
+                  by_category:
+                    type: object
+                    additionalProperties: { type: integer }
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        type: { type: string }
+                        session: { type: string }
+                        tags:
+                          type: array
+                          items: { type: string }
+                        created_at: { type: string }
+                        content: { type: string, description: 'JSON-serialized string' }
+            text/markdown:
+              schema:
+                type: string
+                description: 'format=system-prompt returns size-capped (16 KB) markdown'
+        '304':
+          description: 'If-None-Match matched — no body, same ETag.'
+        '400':
+          description: Invalid categories parameter.
+        '403':
+          description: Missing X-Vcontext-Admin header.
+        '503':
+          description: ramdb_unavailable.
+
   /admin/policy-check:
     post:
       tags: [admin]
