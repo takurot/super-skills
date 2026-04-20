@@ -1,8 +1,11 @@
-# Next-Session Kickoff — 2026-04-21 (updated end-of-2026-04-20)
+# Next-Session Kickoff — 2026-04-21 (final update end-of-2026-04-20)
 
-*Today (2026-04-20) shipped 26 commits through the morning cascade,
-diagnosis correction, admin endpoint trio (Stage 2/3/4), audit of
-20 remaining callers, and a full Stage 4.5 spec. Start here.*
+*Today (2026-04-20) shipped **42 commits** total: morning cascade
+recovery, admin endpoint trio (Stage 2/3/4), 20-caller audit, full
+Stage 4.5 spec, **all Stage 4.5 implementation commits C2-C8+C10**,
+**SKAP v1 Phases A/B/C/D**, and C7b cmdPolicyCheck full HTTP cutover.
+Stage 4.5 is 9 of 10 shipped; only C9 buildRouteTable (H3 — needs
+explicit approval) remains.*
 
 ---
 
@@ -24,7 +27,28 @@ If anything above is off, pause and investigate. Otherwise proceed.
 
 ---
 
-## Today's commit history (26, in reverse chronological)
+## Today's commit history (42, in reverse chronological — only the 16 evening commits shown; see `git log` for the full list)
+
+```
+715ab5c  docs(runbooks): SKAP Phase D — cross-machine runbook
+c42f683  feat(aios): SKAP Phase C — GET /aios/mcp-manifest
+ed04c38  feat(admin+hooks): C7b — /admin/db-size + cmdPolicyCheck HTTP
+4a66b28  feat(hooks): SKAP Phase B — SessionStart pulls bootstrap
+8cbe1f0  feat(aios): SKAP Phase A — GET /aios/bootstrap
+a4f2192  feat(server): Stage 4.5 C10 — /store hardening + [obj] sweep
+18726c6  feat(shell): Stage 4.5 C8 — dead-path shell cleanup
+a890e6e  feat(hooks): Stage 4.5 C7 — cmdSnapshot + cmdMetrics → HTTP
+60cd422  feat(maintenance): Stage 4.5 C6 — 8 sqlite3 spawns → HTTP
+eff19aa  feat(admin): Stage 4.5 C5 — verify-backup worker_thread (AC-4)
+528139f  feat(admin): Stage 4.5 C4 — metrics/window + gc/dry-run + policy
+9980872  feat(admin): Stage 4.5 C3 — /admin/auto-tune + /admin/snapshot
+c3fca80  docs(export): AIOS overview for NotebookLM
+69fbdd1  feat(admin): Stage 4.5 C2 — /admin/vacuum (size-guarded)
+4bb02ec  docs: SKAP v1 spec + shared-knowledge source-of-truth principle
+ac0476d  docs(handoff): 2026-04-21 kickoff + evolution-log cycle 16
+```
+
+Earlier afternoon (26 commits):
 
 ```
 246c5b4  docs(specs): Stage 4.5 implementation spec              ← ship target for tomorrow
@@ -57,45 +81,60 @@ cc697e4  fix(watchdog): cold-boot grace + softer defaults
 
 ---
 
-## Priority 1 — Stage 4.5 implementation (main work, ~800 add / ~250 delete)
+## Priority 1 — Stage 4.5 + SKAP status
 
-**Spec**: `docs/specs/2026-04-21-stage-4.5-spec.md` (671 lines).
-**Goal**: eliminate ALL remaining primary.sqlite access from outside
-the server process. True P1 loose coupling end-state.
+**Stage 4.5** (`docs/specs/2026-04-21-stage-4.5-spec.md`, 671 lines):
+**9 of 10 commits shipped 2026-04-20. Only C9 (H3) remains.**
 
-**Commit sequence (safety-first order)**:
+- ~~C1: hourly VACUUM delete~~ → `884cc0b` (UC1 fix) ✓
+- ~~C2: /admin/vacuum~~ → `69fbdd1` ✓ (size-guarded, 512 MiB threshold)
+- ~~C3: /admin/auto-tune + /admin/snapshot~~ → `9980872` ✓
+- ~~C4: /admin/metrics/window + /admin/gc/dry-run + /admin/policy-check~~ → `528139f` ✓
+- ~~C5: verify-backup event-loop stall~~ → `eff19aa` ✓ (worker_thread, AC-4 PASSED: 20s → 1ms)
+- ~~C6: maintenance.sh HTTP~~ → `60cd422` ✓ (8 sqlite3 spawns → 4 curl)
+- ~~C7: hooks.js cmdSnapshot + cmdMetrics~~ → `a890e6e` ✓
+- ~~C7b: /admin/db-size + cmdPolicyCheck full HTTP~~ → `ed04c38` ✓ **(bonus)**
+- ~~C8: dead-path shell cleanup~~ → `18726c6` ✓ (self-improve.sh + abtest.sh)
+- **C9**: hooks.js `buildRouteTable` HTTP cutover. **H3 — needs explicit
+  user approval.** Option A (singleton `new Database(DB, {readonly})`)
+  vs Option B (HTTP + in-memory cache). Spec recommends B. Keep
+  `VCTX_ROUTE_TABLE_MODE=sqlite` fallback for 24 h post-cutover.
+- ~~C10: hardening (partial)~~ → `a4f2192` ✓ (/store content-type
+  validation + [object Object] boot sweep)
+  - Still pending in C10 scope: path-assert guards on DB_PATH writes,
+    OpenAPI-sync checker script, comprehensive-qa SKILL.md update
 
-- ~~C1: hourly VACUUM delete~~ **already in `884cc0b` (UC1 fix)** — skip
-- **C2**: server.js — add `POST /admin/vacuum` with rate-limit
-  (satisfies AC 7, 8). H2.
-- **C3**: server.js — add `POST /admin/auto-tune` + `POST /admin/snapshot`.
-  Replaces maintenance.sh auto-tune block + hooks.js cmdSnapshot. H2.
-- **C4**: server.js — add `GET /admin/metrics/window?hours=N` +
-  `POST /admin/gc/dry-run` + `POST /admin/policy-check`. H2.
-- **C5**: server.js — fix `/admin/verify-snapshot` event-loop stall
-  (UC3). ~30 LOC worker-thread or async chunks. H2.
-- **C6**: maintenance.sh — swap 8 sqlite3 spawns for curl calls.
-  Uses C3-C4 endpoints. H2.
-- **C7**: hooks.js — cmdSnapshot + cmdPolicyCheck + cmdGc dry-run
-  + 4 other non-hot-path commands → HTTP clients. H2.
-- **C8**: watchdog.sh (done in 3fe4b33 for WAL checkpoint only),
-  pre-outage.sh, self-improve.sh, abtest.sh, experiment-thinking-skip.sh
-  — dead-path shell cleanup + redirect. H2.
-- **C9**: hooks.js — buildRouteTable HTTP cutover. **H3 — needs
-  explicit user approval.** Option A (singleton `new Database(DB,
-  {readonly})`) vs Option B (HTTP + in-memory cache). Spec
-  recommends B. Keep `VCTX_ROUTE_TABLE_MODE=sqlite` fallback for 24 h
-  post-cutover.
-- **C10**: hardening — `assert(path !== DB_PATH)` guards,
-  OpenAPI-sync check, comprehensive-qa SKILL.md doc update. H2.
+**SKAP v1** (`docs/specs/2026-04-21-aios-shared-knowledge-access-protocol.md`):
+**4 of 6 phases shipped 2026-04-20.**
+
+- ~~Phase A: GET /aios/bootstrap~~ → `8cbe1f0` ✓ (ETag + 304 + format=system-prompt)
+- ~~Phase B: SessionStart hook injection~~ → `4a66b28` ✓
+- ~~Phase C: /aios/mcp-manifest~~ → `c42f683` ✓ (4 tools)
+- ~~Phase D: Tailscale runbook~~ → `715ab5c` ✓ (`docs/runbooks/skap-cross-machine.md`)
+- **Phase E**: POST /aios/lessons write-path (HITL-gated) + MCP stdio bridge process.
+  Needs explicit HITL design — how does an external AI confirm with the
+  user before writing? Possibilities: require a signed user-token header,
+  require a one-time code, or require the user to click a dashboard button.
+- **Phase F**: /admin/kb-diff divergence detector (flag when CLAUDE.md
+  rules don't have a vcontext counterpart, or vice versa). ~100 LOC,
+  low risk.
 
 **Dependencies**:
-- C2-C5 independent (parallelizable)
-- C6 depends on C3, C4
-- C7 depends on C3 (cmdSnapshot → /admin/snapshot)
-- C8 can ship anytime after C2+C4
-- C9 depends on C4 (or a dedicated /admin/route-table) + **user H3 go**
-- C10 ships last
+- C2-C8 + C10: **all shipped**
+- C9: depends on user H3 go on Option A vs B
+- Phase F (SKAP divergence detector): independent, can ship anytime
+
+**Priorities for 2026-04-21**:
+1. **Soak observation**: let SIGKILL-137 count stay flat 4-6 h.
+   If it doesn't, investigate before touching more code (the
+   morning cascade originated in exactly this class of miss).
+2. **C9 HITL decision**: ask user which option A vs B for
+   `buildRouteTable`. Spec recommends Option B (loopback ~2ms
+   cost, true P1). Once decided, ~80 LOC change with
+   `VCTX_ROUTE_TABLE_MODE=sqlite` fallback.
+3. **SKAP Phase F**: /admin/kb-diff. Guards against CLAUDE.md
+   drift from vcontext truth. Useful, optional, ~100 LOC.
+4. **LLM recovery**: only after C9 lands and SIGKILL is clean.
 
 ---
 
@@ -107,8 +146,8 @@ the server process. True P1 loose coupling end-state.
 |---|-----------|---------|--------|
 | 1 | Stage 3b twin-writers solved | ✓ | ✓ |
 | 2 | Stage 4 GREEN | ✓ | ✓ |
-| 3 | Stage 4.5 audit + redirect | ✓ audit, ✗ C2-10 | ✓ after impl |
-| 4 | Server SIGKILL-137 = 0 for 4-6h | TBD | — |
+| 3 | Stage 4.5 audit + redirect | ✓ audit + C2-C10 (9/10) | ✓ |
+| 4 | Server SIGKILL-137 = 0 for 4-6h | TBD (end-of-2026-04-20: 125) | — |
 | 5 | Passive observation of 3a/3b/4 per cycle | partial | — |
 
 **Trigger**:
@@ -147,16 +186,18 @@ launchctl disable gui/$(id -u)/com.vcontext.mlx-generate
 - `docs/principles/shared-knowledge-source-of-truth.md` — **NEW evening**: vcontext is source of truth, CLAUDE.md is cache
 - `docs/specs/2026-04-20-true-loose-coupling-redesign.md` — parent spec (Stage 1-4)
 - `docs/specs/2026-04-21-stage-4.5-spec.md` — **THIS SESSION'S TARGET**
-- `docs/specs/2026-04-21-aios-shared-knowledge-access-protocol.md` — **NEW evening**: SKAP v1 (cross-AI bootstrap endpoint, Phase A-F)
+- `docs/specs/2026-04-21-aios-shared-knowledge-access-protocol.md` — SKAP v1 (cross-AI bootstrap endpoint, Phase A-F — A/B/C/D **shipped**)
 - `docs/specs/2026-04-20-ts-strict-migration-plan.md` — TS Phase 2 (H3, deferred)
 - `docs/specs/2026-04-20-mlx-lazy-load-proxy.md` — proxy spec
-- `docs/schemas/vcontext-api-v1.yaml` — OpenAPI, 78 endpoints (75 + 3 admin trio)
+- `docs/schemas/vcontext-api-v1.yaml` — OpenAPI, ~86 endpoints (added 8 via Stage 4.5 + SKAP)
 - `docs/analysis/2026-04-20-integrity-caller-audit.md` — 20-caller audit (Stage 4.5 basis)
 - `docs/analysis/2026-04-20-server-instability-diagnosis.md` — morning corrected diagnosis
 - `docs/analysis/2026-04-20-stability-research-refs.md` — 42 external references
 - `docs/analysis/phase-stage-2-review.md` — phase-gate review
 - `docs/runbooks/hooks-phase1-rollback.md` — <30s rollback
+- `docs/runbooks/skap-cross-machine.md` — **NEW evening**: cross-machine SKAP access (Tailscale / ssh -L)
 - `docs/roadmap/model-candidates.md` — Qwen3.6 deferred
+- `docs/export/aios-for-notebooklm.md` — **NEW evening**: 332-line AIOS overview for NotebookLM ingestion
 
 ### New vcontext shared-knowledge entries (2026-04-20 evening)
 
@@ -167,12 +208,12 @@ launchctl disable gui/$(id -u)/com.vcontext.mlx-generate
 - `lesson-learned` id=224684 — dismissive-negation
 - all under session=`aios-shared-knowledge`, tags include `evidence-before-claim`
 
-### Evening additions to Priority pipeline
+### Evening additions (all SHIPPED 2026-04-20)
 
-- **P1.5 (after Stage 4.5 C10)**: SKAP Phase A+B — `/aios/bootstrap` endpoint + SessionStart hook integration. ~150 LOC, H2.
-- **P1.6 (after P1.5)**: SKAP Phase C+D — MCP manifest + Tailscale runbook. Opens cross-AI access.
-- **Hygiene**: 2 `[object Object]` rows in entries table (id=224646 + 1 other) to be cleaned by Stage 4.5 C10 hardening sweep. Root cause: `/store` accepted object for `content` field and coerced to "[object Object]" via implicit toString — add content-type validation in same C10 commit.
-- **Bug**: MLX embed path throws `s.slice is not a function` when content is not a string. Bounded by C10 validation fix; until then, clients MUST pre-serialize objects to JSON strings before POST /store.
+- ~~P1.5: SKAP Phase A+B~~ → `8cbe1f0` + `4a66b28` ✓
+- ~~P1.6: SKAP Phase C+D~~ → `c42f683` + `715ab5c` ✓
+- ~~Hygiene: 2 [object Object] rows~~ → cleaned in `a4f2192` ✓
+- ~~Bug: MLX embed s.slice~~ → addressed in `a4f2192` ✓ (content-type guard rejects object content before embed)
 
 ---
 
