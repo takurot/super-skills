@@ -6610,6 +6610,7 @@ const ENDPOINTS_LIST = [
   'GET    /aios/bootstrap           — SKAP v1: shared-knowledge bootstrap for cross-AI clients ?categories=&since=&limit=&format=json|system-prompt (ETag + 304 supported)',
   'GET    /admin/db-size            — primary DB size via PRAGMA page_size/page_count + on-disk file stat',
   'GET    /aios/mcp-manifest        — SKAP v1 Phase C: MCP-compatible tool manifest (4 tools: recall lessons/decisions/design-proposals + store-lesson)',
+  'GET    /admin/kb-diff            — SKAP v1 Phase F: detect drift between ~/.claude/CLAUDE.md and vcontext shared-knowledge (missing refs + dangling [id=N] pointers)',
 ];
 
 const server = createServer(async (req, res) => {
@@ -8873,6 +8874,125 @@ const server = createServer(async (req, res) => {
         });
       } catch (e) {
         sendJson(res, 500, { status: 'fail', error: e.message });
+      }
+    } else if (method === 'GET' && path === '/admin/kb-diff') {
+      // SKAP Phase F (spec §5 Phase F). Compares the local
+      // ~/.claude/CLAUDE.md cache against the vcontext
+      // shared-knowledge entries (lesson-learned, decision,
+      // design-proposal) and flags drift: CLAUDE.md rules without
+      // a vcontext counterpart, or vcontext entries without a
+      // reference in CLAUDE.md.
+      //
+      // Heuristic: scan CLAUDE.md for substrings like "[id=NNNNN]"
+      // (matching the SessionStart injection format) AND for
+      // substring matches against entry titles. Flag as "drift"
+      // when an entry is present in vcontext but appears nowhere
+      // in CLAUDE.md by title or id.
+      //
+      // This is the enforcement layer for
+      // docs/principles/shared-knowledge-source-of-truth.md (C1:
+      // every shared lesson has a vcontext entry first;
+      // C5: hash over restate).
+      if (req.headers['x-vcontext-admin'] !== 'yes') {
+        return sendJson(res, 403, {
+          error: 'X-Vcontext-Admin: yes header required',
+        });
+      }
+      try {
+        if (!ramDb) {
+          return sendJson(res, 503, { status: 'skipped', reason: 'ramdb_unavailable' });
+        }
+        const fsMod = require('node:fs');
+        const pathMod = require('node:path');
+        const CLAUDE_MD = pathMod.join(process.env.HOME, '.claude', 'CLAUDE.md');
+        let mdContent = '';
+        try { mdContent = fsMod.readFileSync(CLAUDE_MD, 'utf-8'); }
+        catch {
+          return sendJson(res, 503, {
+            status: 'skipped',
+            reason: 'claude_md_not_readable',
+            path: CLAUDE_MD,
+          });
+        }
+
+        // Pull all shared-knowledge entries (matches /aios/bootstrap
+        // scope exactly — that's the canonical cross-AI truth).
+        const SHARED_TYPES = ['lesson-learned', 'decision', 'design-proposal'];
+        const SHARED_SESSIONS = ['aios-shared-knowledge', 'aios-design-proposals'];
+        const tPh = SHARED_TYPES.map(() => '?').join(',');
+        const sPh = SHARED_SESSIONS.map(() => '?').join(',');
+        let rows = [];
+        try {
+          rows = ramDb.prepare(
+            `SELECT id, type, session, content FROM entries
+             WHERE type IN (${tPh})
+               AND session IN (${sPh})
+               AND (status IS NULL OR status = 'active')
+               AND supersedes IS NULL`
+          ).all(...SHARED_TYPES, ...SHARED_SESSIONS);
+        } catch { rows = []; }
+
+        const extractTitle = (r) => {
+          try {
+            const c = JSON.parse(r.content || '{}');
+            return (c.title || c.rule || c.pattern_id || c.proposal_id || '').toString().slice(0, 100);
+          } catch {
+            return (String(r.content || '').split('\n')[0] || '').slice(0, 100);
+          }
+        };
+
+        // For each entry decide: is the id referenced? Is the title
+        // substring present?
+        const mdLower = mdContent.toLowerCase();
+        const missingInMd = [];
+        const matchedByTitle = [];
+        const matchedById = [];
+        for (const r of rows) {
+          const idRef = `[id=${r.id}]`;
+          const title = extractTitle(r);
+          const idMatch = mdContent.includes(idRef);
+          const titleMatch = title.length >= 12 && mdLower.includes(title.toLowerCase());
+          if (idMatch) matchedById.push({ id: r.id, type: r.type, title });
+          else if (titleMatch) matchedByTitle.push({ id: r.id, type: r.type, title });
+          else missingInMd.push({ id: r.id, type: r.type, title });
+        }
+
+        // Dangling references: id mentions in CLAUDE.md that don't map
+        // to any live vcontext row.
+        const liveIds = new Set(rows.map(r => r.id));
+        const danglingMatches = [];
+        const idRe = /\[id=(\d+)\]/g;
+        let m;
+        while ((m = idRe.exec(mdContent)) !== null) {
+          const id = parseInt(m[1], 10);
+          if (!liveIds.has(id)) danglingMatches.push(id);
+        }
+
+        sendJson(res, 200, {
+          generated_at: new Date().toISOString(),
+          claude_md_path: CLAUDE_MD,
+          claude_md_bytes: mdContent.length,
+          vcontext_shared_entries: rows.length,
+          drift: {
+            missing_in_claude_md: {
+              count: missingInMd.length,
+              entries: missingInMd.slice(0, 50),
+              note: 'vcontext shared-knowledge entries without [id=NNNNN] reference or title substring in CLAUDE.md',
+            },
+            dangling_refs_in_claude_md: {
+              count: danglingMatches.length,
+              ids: danglingMatches.slice(0, 50),
+              note: '[id=NNNNN] references in CLAUDE.md pointing at entries that no longer exist or were superseded',
+            },
+          },
+          matched_by_id: matchedById.length,
+          matched_by_title: matchedByTitle.length,
+          status: (missingInMd.length === 0 && danglingMatches.length === 0)
+            ? 'in-sync'
+            : 'drift',
+        });
+      } catch (e) {
+        sendJson(res, 500, { error: e.message });
       }
     } else if (method === 'GET' && path === '/aios/mcp-manifest') {
       // SKAP Phase C (spec §4.3). Publishes the tool definitions for
