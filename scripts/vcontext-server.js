@@ -6569,6 +6569,7 @@ const ENDPOINTS_LIST = [
   'POST   /admin/integrity-check    — run integrity_check + quick_check {target?: "primary"|"backup"} (default: backup, rate-limited 1/h)',
   'POST   /admin/backup             — trigger a .backup() snapshot of primary → BACKUP_PATH (rate-limited 1/60s, in-flight guard)',
   'POST   /admin/wal-checkpoint     — run PRAGMA wal_checkpoint(mode) on primary {mode?: "PASSIVE"|"FULL"|"RESTART"|"TRUNCATE"} (default: TRUNCATE)',
+  'POST   /admin/vacuum             — VACUUM primary (size-guarded, rate-limited 1/7d) {target?:"primary"|"backup",force?:bool}; deferred if DB>VCTX_VACUUM_MAX_BYTES (default 512MiB) unless force+VCTX_VACUUM_ALLOW_LARGE=1; backup target not yet implemented',
 ];
 
 const server = createServer(async (req, res) => {
@@ -7805,6 +7806,159 @@ const server = createServer(async (req, res) => {
             Math.ceil(JSON.stringify(result).length / 4),
             require('node:crypto').createHash('sha256')
               .update(`wal-checkpoint:${mode}:${startT}`).digest('hex'),
+          );
+        } catch { /* non-fatal */ }
+
+        sendJson(res, 200, result);
+      } catch (e) {
+        sendJson(res, 500, { status: 'fail', error: e.message });
+      }
+    } else if (method === 'POST' && path === '/admin/vacuum') {
+      // Stage 4.5 Commit C2 (docs/specs/2026-04-21-stage-4.5-spec.md §3.2.5).
+      // Replaces hooks.js:2316 hourly VACUUM (audit UC1/#11, already
+      // removed in 884cc0b) and maintenance.sh:156 weekly VACUUM.
+      //
+      // Body: { target?: "primary"|"backup", force?: boolean }
+      //   default target: "primary"
+      // Returns: { status, target, freed_bytes?, elapsed_ms?, ran_at? }
+      //   statuses: ok | skipped | deferred | disabled | not_implemented | fail
+      //
+      // Safety deviations from spec §3.2.5 (primary.sqlite is ~6.7 GB
+      // as of 2026-04-20, so a sync VACUUM would block the event loop
+      // for minutes and invite watchdog SIGKILL):
+      //
+      //   Size guard — if target file size > VCTX_VACUUM_MAX_BYTES
+      //   (default 512 MiB), refuse with status=deferred UNLESS the
+      //   caller sets `force=true` AND env VCTX_VACUUM_ALLOW_LARGE=1.
+      //   Both are required so that a stray cron can't accidentally
+      //   trigger a 10-minute stall.
+      //
+      //   target=backup — deferred (501). Would require a second
+      //   better-sqlite3 connection to BACKUP_PATH; not in C2 scope.
+      //   Follow-up commit C2b after worker-thread scaffolding lands.
+      //
+      // Rate-limit: 1 per 7 days per target, persisted as an
+      // admin-vacuum-run entry. `force=true` bypasses the rate gate
+      // (but NOT the size gate unless the env var is also set).
+      //
+      // Rollback: VCTX_VACUUM_DISABLED=1 → unconditional 503.
+      if (req.headers['x-vcontext-admin'] !== 'yes') {
+        return sendJson(res, 403, {
+          error: 'X-Vcontext-Admin: yes header required for admin operations',
+        });
+      }
+      if (process.env.VCTX_VACUUM_DISABLED === '1') {
+        return sendJson(res, 503, {
+          status: 'disabled',
+          reason: 'VCTX_VACUUM_DISABLED=1',
+        });
+      }
+      try {
+        const body = await readBody(req);
+        const VALID_TARGETS = ['primary', 'backup'];
+        const target = (body && typeof body.target === 'string') ? body.target : 'primary';
+        const force = !!(body && body.force === true);
+        if (!VALID_TARGETS.includes(target)) {
+          return sendJson(res, 400, {
+            error: `Invalid target. Must be one of: ${VALID_TARGETS.join(', ')}`,
+            received: target,
+          });
+        }
+        if (!ramDb) {
+          return sendJson(res, 503, { status: 'skipped', reason: 'ramdb_unavailable' });
+        }
+
+        // Backup target deferred to C2b (needs separate connection).
+        if (target === 'backup') {
+          return sendJson(res, 501, {
+            status: 'not_implemented',
+            target,
+            reason: 'backup_target_deferred',
+            hint: 'target=backup requires a dedicated better-sqlite3 connection to BACKUP_PATH; scheduled for C2b after worker-thread scaffolding. Until then use target=primary or run VACUUM INTO offline.',
+          });
+        }
+
+        // Rate-limit: look up last run for this target.
+        const RATE_LIMIT_MS = 7 * 24 * 60 * 60 * 1000;
+        const targetTag = `"target:${target}"`;
+        let recentRow;
+        try {
+          recentRow = ramDb.prepare(
+            `SELECT created_at FROM entries
+             WHERE type = 'admin-vacuum-run'
+               AND tags LIKE '%' || ? || '%'
+             ORDER BY id DESC LIMIT 1`
+          ).get(targetTag);
+        } catch { recentRow = null; }
+        if (recentRow && !force) {
+          const lastMs = Date.parse(recentRow.created_at.replace(' ', 'T') + 'Z');
+          const age = Date.now() - (Number.isFinite(lastMs) ? lastMs : 0);
+          if (age < RATE_LIMIT_MS) {
+            return sendJson(res, 200, {
+              status: 'skipped',
+              target,
+              reason: 'recent_vacuum',
+              last_ran_at: recentRow.created_at,
+              age_ms: age,
+              retry_after_ms: RATE_LIMIT_MS - age,
+            });
+          }
+        }
+
+        // Size guard.
+        const MAX_BYTES = parseInt(
+          process.env.VCTX_VACUUM_MAX_BYTES || String(512 * 1024 * 1024),
+          10,
+        );
+        const allowLarge = process.env.VCTX_VACUUM_ALLOW_LARGE === '1';
+        let dbSizeBefore = 0;
+        try {
+          const st = require('node:fs').statSync(DB_PATH);
+          dbSizeBefore = st.size;
+        } catch { /* ignore */ }
+
+        if (dbSizeBefore > MAX_BYTES && !(force && allowLarge)) {
+          return sendJson(res, 503, {
+            status: 'deferred',
+            target,
+            reason: 'db_too_large_for_sync_vacuum',
+            current_bytes: dbSizeBefore,
+            threshold_bytes: MAX_BYTES,
+            hint: 'set body.force=true AND env VCTX_VACUUM_ALLOW_LARGE=1 to override (accepts event-loop stall). Prefer waiting for worker-thread VACUUM (C2b).',
+          });
+        }
+
+        // Execute VACUUM. WARNING: blocks event loop for the duration.
+        // With the size guard above this path only runs when DB
+        // <= MAX_BYTES (or caller explicitly opted into large-DB stall).
+        const startT = Date.now();
+        ramDb.exec('VACUUM;');
+        let dbSizeAfter = dbSizeBefore;
+        try {
+          dbSizeAfter = require('node:fs').statSync(DB_PATH).size;
+        } catch { /* ignore */ }
+
+        const result = {
+          status: 'ok',
+          target,
+          freed_bytes: Math.max(0, dbSizeBefore - dbSizeAfter),
+          bytes_before: dbSizeBefore,
+          bytes_after: dbSizeAfter,
+          elapsed_ms: Date.now() - startT,
+          ran_at: new Date().toISOString(),
+        };
+
+        // Persist run record for rate-limit gate on next call.
+        try {
+          ramDb.prepare(
+            `INSERT INTO entries (type, content, tags, session, token_estimate, created_at, content_hash)
+             VALUES ('admin-vacuum-run', ?, ?, 'admin-op', ?, datetime('now'), ?)`
+          ).run(
+            JSON.stringify(result),
+            JSON.stringify(['admin-op', 'op:vacuum', `target:${target}`]),
+            Math.ceil(JSON.stringify(result).length / 4),
+            require('node:crypto').createHash('sha256')
+              .update(`vacuum:${target}:${startT}`).digest('hex'),
           );
         } catch { /* non-fatal */ }
 

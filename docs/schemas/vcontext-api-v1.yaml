@@ -2375,6 +2375,90 @@ paths:
         '503':
           description: ramDb not available.
 
+  /admin/vacuum:
+    post:
+      tags: [admin]
+      operationId: adminVacuum
+      summary: Run VACUUM on primary (size-guarded, rate-limited 1/7d)
+      description: |
+        Stage 4.5 Commit C2 (docs/specs/2026-04-21-stage-4.5-spec.md §3.2.5).
+        Replaces hooks.js:2316 hourly VACUUM (audit UC1/#11, already removed
+        in 884cc0b) and maintenance.sh:156 weekly VACUUM.
+
+        Safety deviations from spec §3.2.5 (primary is ~6.7 GB as of
+        2026-04-20, sync VACUUM would block the event loop for minutes):
+
+          - Size guard: refuses with status=deferred (HTTP 503) if
+            DB size > VCTX_VACUUM_MAX_BYTES (default 512 MiB) unless
+            body.force=true AND env VCTX_VACUUM_ALLOW_LARGE=1.
+          - target=backup: deferred to C2b (501 not_implemented).
+            Requires separate connection to BACKUP_PATH.
+
+        Rate-limit: 1 per 7 days per target, persisted as
+        admin-vacuum-run entry. force=true bypasses rate gate but NOT
+        size gate unless env flag is also set.
+
+        Rollback: VCTX_VACUUM_DISABLED=1 → unconditional 503.
+      security:
+        - BearerAuth: []
+          AdminHeader: []
+      parameters:
+        - in: header
+          name: X-Vcontext-Admin
+          required: true
+          schema: { type: string, enum: [yes] }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target:
+                  type: string
+                  enum: [primary, backup]
+                  default: primary
+                force:
+                  type: boolean
+                  default: false
+                  description: |
+                    Bypass the 7-day rate-limit. Does NOT bypass the
+                    size guard alone — VCTX_VACUUM_ALLOW_LARGE=1 env
+                    must also be set for large-DB VACUUM.
+      responses:
+        '200':
+          description: |
+            VACUUM completed (status=ok) or rate-limit skip (status=skipped).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok, skipped] }
+                  target: { type: string, enum: [primary, backup] }
+                  freed_bytes: { type: integer }
+                  bytes_before: { type: integer }
+                  bytes_after: { type: integer }
+                  elapsed_ms: { type: integer }
+                  ran_at: { type: string, format: date-time }
+                  reason: { type: string, description: 'present when status=skipped (e.g. "recent_vacuum")' }
+                  last_ran_at: { type: string, format: date-time }
+                  age_ms: { type: integer }
+                  retry_after_ms: { type: integer }
+        '400':
+          description: Invalid target.
+        '403':
+          description: Missing X-Vcontext-Admin header.
+        '501':
+          description: target=backup — not implemented in C2 (deferred to C2b).
+        '503':
+          description: |
+            Server cannot proceed. Reasons:
+              - ramdb_unavailable
+              - db_too_large_for_sync_vacuum (see hint for override)
+              - VCTX_VACUUM_DISABLED=1
+        '500':
+          description: Unexpected failure.
+
   /admin/fts-full-rebuild:
     post:
       tags: [admin]
