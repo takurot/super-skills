@@ -2584,6 +2584,179 @@ paths:
         '503':
           description: ramdb_unavailable.
 
+  /admin/metrics/window:
+    get:
+      tags: [admin]
+      operationId: adminMetricsWindow
+      summary: Aggregate api_metrics and entries stats over a time window
+      description: |
+        Stage 4.5 C4 (spec §3.2.3). Replaces vcontext-hooks.js cmdMetrics
+        (6 spawnSync sites) + maintenance.sh perf-regression queries +
+        self-improve / abtest shell-level SELECTs.
+        Server-internal — no external file lock, cachable, cheap.
+      security:
+        - BearerAuth: []
+          AdminHeader: []
+      parameters:
+        - in: header
+          name: X-Vcontext-Admin
+          required: true
+          schema: { type: string, enum: [yes] }
+        - in: query
+          name: hours
+          schema: { type: integer, minimum: 1, maximum: 720, default: 1 }
+        - in: query
+          name: metric
+          schema:
+            type: string
+            enum: [all, api_metrics, entries, latency_p50, latency_p95, latency_p99]
+            default: all
+      responses:
+        '200':
+          description: Aggregated metrics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  window_hours: { type: integer }
+                  api_metrics:
+                    type: object
+                    properties:
+                      latency_p50_ms: { type: integer }
+                      latency_p95_ms: { type: integer }
+                      latency_p99_ms: { type: integer }
+                      request_count: { type: integer }
+                      error_count: { type: integer }
+                  entries:
+                    type: object
+                    properties:
+                      total: { type: integer }
+                      with_embedding: { type: integer }
+                      by_type:
+                        type: object
+                        additionalProperties: { type: integer }
+                      distinct_sessions: { type: integer }
+                  generated_at: { type: string, format: date-time }
+        '400':
+          description: Invalid hours (must be 1..720 integer).
+        '403':
+          description: Missing X-Vcontext-Admin header.
+        '503':
+          description: ramdb_unavailable.
+
+  /admin/gc/dry-run:
+    post:
+      tags: [admin]
+      operationId: adminGcDryRun
+      summary: Report garbage-collection candidates (read-only)
+      description: |
+        Stage 4.5 C4 (spec §3.2.6). Replaces cmdGc dry-run path in
+        hooks.js. Write path (actual deletion) remains elsewhere —
+        this endpoint is deliberately harmless, pure-read.
+      security:
+        - BearerAuth: []
+          AdminHeader: []
+      parameters:
+        - in: header
+          name: X-Vcontext-Admin
+          required: true
+          schema: { type: string, enum: [yes] }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                embedding_prune_days: { type: integer, minimum: 1, maximum: 3650, default: 30 }
+                include_types:
+                  type: array
+                  items: { type: string, pattern: '^[a-zA-Z0-9_-]{1,64}$' }
+      responses:
+        '200':
+          description: GC candidate list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  candidates:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        type: { type: string }
+                        count: { type: integer }
+                        bytes: { type: integer }
+                  total_bytes: { type: integer }
+                  window_end: { type: string, format: date-time }
+                  prune_days: { type: integer }
+                  included_types:
+                    type: array
+                    items: { type: string }
+                  ran_at: { type: string, format: date-time }
+        '403':
+          description: Missing X-Vcontext-Admin header.
+        '503':
+          description: ramdb_unavailable.
+
+  /admin/policy-check:
+    post:
+      tags: [admin]
+      operationId: adminPolicyCheck
+      summary: Run policy checks against recent entries
+      description: |
+        Stage 4.5 C4 (spec §3.2.7). Replaces cmdPolicyCheck 6 spawnSync
+        sites. Built-in checks:
+          - secret-scan: regex for API keys / PEMs in recent content
+          - tier-balance: ram:ssd ratio sanity
+          - policy-violations: count of type='policy-violation' entries
+        Overall status: 'fail' if any finding severity='high',
+                        'warn' if any severity='warn', else 'pass'.
+      security:
+        - BearerAuth: []
+          AdminHeader: []
+      parameters:
+        - in: header
+          name: X-Vcontext-Admin
+          required: true
+          schema: { type: string, enum: [yes] }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                checks:
+                  type: array
+                  items:
+                    type: string
+                    enum: [secret-scan, tier-balance, policy-violations]
+                window_hours: { type: integer, minimum: 1, maximum: 720, default: 24 }
+      responses:
+        '200':
+          description: Policy check result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [pass, warn, fail] }
+                  findings:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        check: { type: string }
+                        count: { type: integer }
+                        severity: { type: string, enum: [info, warn, high] }
+                  window_hours: { type: integer }
+                  ran_at: { type: string, format: date-time }
+        '403':
+          description: Missing X-Vcontext-Admin header.
+        '503':
+          description: ramdb_unavailable.
+
   /admin/fts-full-rebuild:
     post:
       tags: [admin]

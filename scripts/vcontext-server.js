@@ -6572,6 +6572,9 @@ const ENDPOINTS_LIST = [
   'POST   /admin/vacuum             — VACUUM primary (size-guarded, rate-limited 1/7d) {target?:"primary"|"backup",force?:bool}; deferred if DB>VCTX_VACUUM_MAX_BYTES (default 512MiB) unless force+VCTX_VACUUM_ALLOW_LARGE=1; backup target not yet implemented',
   'POST   /admin/auto-tune          — ensure critical indexes + ANALYZE {analyze?:bool,ensure_indexes?:bool,force?:bool} (rate-limited 1/h)',
   'POST   /admin/snapshot           — ramDb.backup() to ~/skills/data/snapshots/<label>-<ts>.db {label:string,include_wal?:bool,force?:bool} (rate-limited 1/10min/label, in-flight guard)',
+  'GET    /admin/metrics/window     — aggregate api_metrics + entries stats ?hours=N&metric=all|api_metrics|entries|latency_*  (hours 1..720)',
+  'POST   /admin/gc/dry-run         — report GC candidates (read-only) {embedding_prune_days?:N,include_types?:[...]}',
+  'POST   /admin/policy-check       — run policy checks (secret-scan, tier-balance, policy-violations) {checks?:[...],window_hours?:N}',
 ];
 
 const server = createServer(async (req, res) => {
@@ -8525,6 +8528,276 @@ const server = createServer(async (req, res) => {
       } catch (e) {
         result.error = e.message;
         sendJson(res, 500, result);
+      }
+    } else if (method === 'GET' && path === '/admin/metrics/window') {
+      // Stage 4.5 Commit C4 (spec §3.2.3). Replaces
+      // vcontext-hooks.js cmdMetrics (6 spawnSync sites) +
+      // maintenance.sh perf-regression block + self-improve/abtest shell
+      // queries. Single HTTP hit, no external file locks.
+      //
+      // Query: ?hours=N&metric=<name>   metric='all' returns everything.
+      // Hours: 1..720 (30 days cap, sanity check).
+      if (req.headers['x-vcontext-admin'] !== 'yes') {
+        return sendJson(res, 403, {
+          error: 'X-Vcontext-Admin: yes header required for admin operations',
+        });
+      }
+      try {
+        const params = parseQuery(req.url);
+        const hours = parseInt(params.hours || '1', 10);
+        const metric = typeof params.metric === 'string' ? params.metric : 'all';
+        if (!Number.isFinite(hours) || hours <= 0 || hours > 720) {
+          return sendJson(res, 400, {
+            error: 'Invalid hours. Must be 1..720 (integer).',
+            received: params.hours,
+          });
+        }
+        if (!ramDb) {
+          return sendJson(res, 503, { status: 'skipped', reason: 'ramdb_unavailable' });
+        }
+
+        const since = `datetime('now', '-${hours} hours')`;
+        const result = { window_hours: hours };
+
+        // ── api_metrics aggregates ──
+        if (metric === 'all' || metric === 'api_metrics' || /^latency_/.test(metric)) {
+          let am = { latency_p50_ms: 0, latency_p95_ms: 0, latency_p99_ms: 0,
+                     request_count: 0, error_count: 0 };
+          try {
+            const row = ramDb.prepare(
+              `SELECT COUNT(*) AS n, AVG(latency_ms) AS avg_lat
+               FROM api_metrics WHERE created_at >= ${since}`
+            ).get();
+            am.request_count = row?.n | 0;
+            // p50/p95/p99 via ORDER BY + LIMIT percentile approximation
+            // (cheap on api_metrics index, avoids window function overhead)
+            if (am.request_count > 0) {
+              const p = (pct) => {
+                const offset = Math.max(0, Math.floor(am.request_count * (1 - pct / 100)));
+                const r = ramDb.prepare(
+                  `SELECT latency_ms FROM api_metrics WHERE created_at >= ${since}
+                   ORDER BY latency_ms DESC LIMIT 1 OFFSET ?`
+                ).get(offset);
+                return Math.round(r?.latency_ms || 0);
+              };
+              am.latency_p50_ms = p(50);
+              am.latency_p95_ms = p(95);
+              am.latency_p99_ms = p(99);
+            }
+          } catch { /* non-fatal */ }
+          result.api_metrics = am;
+        }
+
+        // ── entries aggregates ──
+        if (metric === 'all' || metric === 'entries') {
+          let en = { total: 0, with_embedding: 0, by_type: {}, distinct_sessions: 0 };
+          try {
+            const total = ramDb.prepare(
+              `SELECT COUNT(*) AS n FROM entries WHERE created_at >= ${since}`
+            ).get();
+            en.total = total?.n | 0;
+
+            const withEmb = ramDb.prepare(
+              `SELECT COUNT(*) AS n FROM entries
+               WHERE created_at >= ${since} AND embedding IS NOT NULL`
+            ).get();
+            en.with_embedding = withEmb?.n | 0;
+
+            const byType = ramDb.prepare(
+              `SELECT type, COUNT(*) AS n FROM entries
+               WHERE created_at >= ${since} GROUP BY type`
+            ).all();
+            en.by_type = {};
+            for (const r of byType) en.by_type[r.type] = r.n | 0;
+
+            const sess = ramDb.prepare(
+              `SELECT COUNT(DISTINCT session) AS n FROM entries
+               WHERE created_at >= ${since} AND session IS NOT NULL`
+            ).get();
+            en.distinct_sessions = sess?.n | 0;
+          } catch { /* non-fatal */ }
+          result.entries = en;
+        }
+
+        result.generated_at = new Date().toISOString();
+        sendJson(res, 200, result);
+      } catch (e) {
+        sendJson(res, 500, { status: 'fail', error: e.message });
+      }
+    } else if (method === 'POST' && path === '/admin/gc/dry-run') {
+      // Stage 4.5 Commit C4 (spec §3.2.6). Replaces
+      // vcontext-hooks.js:2288 cmdGc expiry scan. Read-only — the WRITE
+      // side of gc stays on the existing /admin/gc/apply (if present) or
+      // a future POST; this endpoint is deliberately harmless.
+      //
+      // Body: { embedding_prune_days?: N (default 30),
+      //         include_types?: [type,...] (default all candidate types) }
+      if (req.headers['x-vcontext-admin'] !== 'yes') {
+        return sendJson(res, 403, {
+          error: 'X-Vcontext-Admin: yes header required for admin operations',
+        });
+      }
+      try {
+        const body = (await readBody(req)) || {};
+        const pruneDays = Number.isFinite(+body.embedding_prune_days)
+          ? Math.max(1, Math.min(3650, +body.embedding_prune_days))
+          : 30;
+        const defaultTypes = [
+          'skill-discovery', 'skill-suggestion', 'pre-tool', 'tool-use',
+          'assistant-response', 'skill-usage', 'skill-gap',
+        ];
+        const includeTypes = Array.isArray(body.include_types) && body.include_types.length > 0
+          ? body.include_types.filter(t => typeof t === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(t))
+          : defaultTypes;
+        if (!ramDb) {
+          return sendJson(res, 503, { status: 'skipped', reason: 'ramdb_unavailable' });
+        }
+
+        const windowEnd = `datetime('now', '-${pruneDays} days')`;
+        const candidates = [];
+        let totalBytes = 0;
+        try {
+          const stmt = ramDb.prepare(
+            `SELECT COUNT(*) AS count, COALESCE(SUM(length(content)), 0) AS bytes
+             FROM entries
+             WHERE type = ? AND created_at < ${windowEnd}`
+          );
+          for (const t of includeTypes) {
+            const row = stmt.get(t);
+            const c = row?.count | 0;
+            const b = row?.bytes | 0;
+            if (c > 0) {
+              candidates.push({ type: t, count: c, bytes: b });
+              totalBytes += b;
+            }
+          }
+        } catch { /* non-fatal */ }
+
+        sendJson(res, 200, {
+          candidates,
+          total_bytes: totalBytes,
+          window_end: new Date(Date.now() - pruneDays * 24 * 3600 * 1000).toISOString(),
+          prune_days: pruneDays,
+          included_types: includeTypes,
+          ran_at: new Date().toISOString(),
+        });
+      } catch (e) {
+        sendJson(res, 500, { status: 'fail', error: e.message });
+      }
+    } else if (method === 'POST' && path === '/admin/policy-check') {
+      // Stage 4.5 Commit C4 (spec §3.2.7). Replaces
+      // vcontext-hooks.js cmdPolicyCheck's 6 spawnSync sites.
+      //
+      // Body: { checks?: string[], window_hours?: N (default 24) }
+      // Available checks:
+      //   secret-scan       — regex-scan recent entries for
+      //                       obvious credentials (API keys, PEMs)
+      //   tier-balance      — entries per tier (ram/ssd) ratio check
+      //   policy-violations — explicit type='policy-violation' count
+      //
+      // Status logic:
+      //   - any finding with severity='high' → 'fail'
+      //   - any finding with severity='warn' → 'warn'
+      //   - otherwise → 'pass'
+      if (req.headers['x-vcontext-admin'] !== 'yes') {
+        return sendJson(res, 403, {
+          error: 'X-Vcontext-Admin: yes header required for admin operations',
+        });
+      }
+      try {
+        const body = (await readBody(req)) || {};
+        const AVAILABLE = ['secret-scan', 'tier-balance', 'policy-violations'];
+        const requested = Array.isArray(body.checks) && body.checks.length > 0
+          ? body.checks.filter(c => AVAILABLE.includes(c))
+          : AVAILABLE;
+        const hours = Number.isFinite(+body.window_hours)
+          ? Math.max(1, Math.min(720, +body.window_hours))
+          : 24;
+        if (!ramDb) {
+          return sendJson(res, 503, { status: 'skipped', reason: 'ramdb_unavailable' });
+        }
+
+        const since = `datetime('now', '-${hours} hours')`;
+        const findings = [];
+
+        if (requested.includes('secret-scan')) {
+          // Cheap regex over recent entries' content. Keep bounded by
+          // LIMIT to avoid scanning millions on big windows.
+          const SECRET_RE = /(api[_-]?key|aws[_-]?access[_-]?key|secret[_-]?key|ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|-----BEGIN [A-Z]+ PRIVATE KEY-----)/i;
+          let hits = 0;
+          try {
+            const rows = ramDb.prepare(
+              `SELECT id, content FROM entries
+               WHERE created_at >= ${since}
+                 AND length(content) > 10
+               ORDER BY id DESC LIMIT 5000`
+            ).all();
+            for (const r of rows) {
+              if (SECRET_RE.test(r.content || '')) hits++;
+            }
+          } catch { /* non-fatal */ }
+          findings.push({
+            check: 'secret-scan',
+            count: hits,
+            severity: hits > 0 ? 'warn' : 'info',
+            scope: `recent ${hours}h, up to 5000 entries`,
+          });
+        }
+
+        if (requested.includes('tier-balance')) {
+          // Imbalance if ssd:ram ratio > 20 within the window (arbitrary
+          // threshold; easy to tune later).
+          let byTier = { ram: 0, ssd: 0, other: 0 };
+          try {
+            const rows = ramDb.prepare(
+              `SELECT COALESCE(tier,'other') AS tier, COUNT(*) AS n FROM entries
+               WHERE created_at >= ${since} GROUP BY tier`
+            ).all();
+            for (const r of rows) {
+              const key = (r.tier === 'ram' || r.tier === 'ssd') ? r.tier : 'other';
+              byTier[key] += r.n | 0;
+            }
+          } catch { /* non-fatal */ }
+          const ratio = byTier.ram > 0 ? byTier.ssd / byTier.ram : Infinity;
+          findings.push({
+            check: 'tier-balance',
+            count: byTier.ram + byTier.ssd + byTier.other,
+            severity: (Number.isFinite(ratio) && ratio > 20) ? 'warn' : 'info',
+            by_tier: byTier,
+            ssd_to_ram_ratio: Number.isFinite(ratio) ? Math.round(ratio * 100) / 100 : null,
+          });
+        }
+
+        if (requested.includes('policy-violations')) {
+          let count = 0;
+          try {
+            const row = ramDb.prepare(
+              `SELECT COUNT(*) AS n FROM entries
+               WHERE type = 'policy-violation' AND created_at >= ${since}`
+            ).get();
+            count = row?.n | 0;
+          } catch { /* non-fatal */ }
+          findings.push({
+            check: 'policy-violations',
+            count,
+            severity: count > 0 ? 'high' : 'info',
+          });
+        }
+
+        // Derive overall status.
+        const sev = findings.map(f => f.severity);
+        const overall = sev.includes('high') ? 'fail'
+                      : sev.includes('warn') ? 'warn'
+                      : 'pass';
+
+        sendJson(res, 200, {
+          status: overall,
+          findings,
+          window_hours: hours,
+          ran_at: new Date().toISOString(),
+        });
+      } catch (e) {
+        sendJson(res, 500, { status: 'fail', error: e.message });
       }
     } else if (method === 'POST' && path === '/admin/fts-full-rebuild') {
       // Nuclear rebuild: drop FTS + triggers, recreate, reindex from entries,
