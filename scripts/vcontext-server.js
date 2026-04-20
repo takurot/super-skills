@@ -1568,7 +1568,15 @@ async function handleStore(req, res) {
   // recall, workflow inference, and anomaly detection. Empty set =
   // embed all (handler still skips empty content).
   const NO_EMBED_TYPES = new Set();
-  if (mlxAvailable && !NO_EMBED_TYPES.has(type)) {
+  // C11 D4 (2026-04-20): respect embed circuit-open state.
+  // When the embed-loop has opened the circuit due to mlx-embed
+  // failures, /store callbacks that call mlxEmbed() would allocate
+  // request + response buffers under memory pressure, defeating the
+  // whole point of the breaker. Skip the embed entirely during the
+  // open window; the row is stored without an embedding, and the
+  // embed-loop will backfill after the circuit closes.
+  const _c11StoreGateActive = process.env.VCTX_EMBED_C11_DISABLED !== '1';
+  if (mlxAvailable && !NO_EMBED_TYPES.has(type) && !(_c11StoreGateActive && _isEmbedCircuitOpen())) {
     setImmediate(async () => {
       try {
         let embedding = null;
@@ -3431,6 +3439,12 @@ function formatBytes(bytes) {
 
 // ── Streaming embed (MLX: always-on, GPU-accelerated) ──────────
 let embedLoopRunning = false;
+// C11 D3/D4 (2026-04-20): module-scoped circuit-breaker state so
+// BOTH the embed-loop (batch path) AND the /store setImmediate
+// callback (single-item path) can read + update atomically.
+// Zero = circuit closed; positive = epoch-ms until it closes.
+let _embedCircuitOpenUntil = 0;
+const _isEmbedCircuitOpen = () => Date.now() < _embedCircuitOpenUntil;
 // Loop heartbeat — each iteration updates the timestamp so a stuck loop
 // (stuck on await or caught in retry backoff) is distinguishable from an
 // intentionally-idle loop.  Exposed via /pipeline/health.
@@ -3481,17 +3495,35 @@ async function startEmbedLoop() {
   //
   // Rollback: VCTX_EMBED_C11_DISABLED=1 skips the circuit check,
   // reverting to today's unconditional-retry behavior.
-  let circuitOpenUntil = 0;
+  //
+  // Mutates module-level _embedCircuitOpenUntil so the store-path
+  // setImmediate callback can also respect the open state (C11 D4 —
+  // agent review showed the batch-only gate let /store-triggered
+  // embeds still allocate buffers during outage).
   const C11_CIRCUIT_OPEN_MS = 120_000;
   const C11_CIRCUIT_OPEN_STREAK = 3;
   const C11_DISABLED = process.env.VCTX_EMBED_C11_DISABLED === '1';
   if (!C11_DISABLED) {
-    console.log('[embed-loop] C11 active: batch timeout=60s, circuit-breaker on streak>=3 (VCTX_EMBED_C11_DISABLED=1 to revert)');
+    console.log('[embed-loop] C11 active: batch timeout=60s, circuit-breaker on streak>=3, store-path gated (VCTX_EMBED_C11_DISABLED=1 to revert)');
   }
 
+  // C11 D7-lite (2026-04-20): RSS sampling for tomorrow's evidence.
+  // Emits one log line every 30 iterations (~3-5 min on healthy runs)
+  // so the 4-h soak window accumulates RSS trace data without flooding
+  // the log. This lets tomorrow's review confirm/falsify H5 memory-
+  // pressure theory with actual numbers (agent's recommendation #1).
+  let _rssSampleIter = 0;
+  const RSS_SAMPLE_EVERY = 30;
   while (embedLoopRunning) {
     _loopHeartbeat.embed = Date.now();
     _loopHeartbeat.embed_iter++;
+    _rssSampleIter++;
+    if (!C11_DISABLED && _rssSampleIter % RSS_SAMPLE_EVERY === 0) {
+      try {
+        const mu = process.memoryUsage();
+        console.log(`[embed-loop:rss] iter=${_loopHeartbeat.embed_iter} rss=${Math.round(mu.rss/1048576)}MB heap=${Math.round(mu.heapUsed/1048576)}/${Math.round(mu.heapTotal/1048576)}MB external=${Math.round(mu.external/1048576)}MB streak=${consecutiveFailures} circuit=${Date.now() < _embedCircuitOpenUntil ? 'open' : 'closed'}`);
+      } catch { /* non-fatal */ }
+    }
     // Ensure MLX embed backend is available
     if (!mlxAvailable) {
       // await so the flag reflects the latest probe before we decide to skip.
@@ -3515,7 +3547,7 @@ async function startEmbedLoop() {
     // call MLX nor allocate request buffers — the loop essentially
     // idles, letting MLX (or the OS memory pressure it's contributing
     // to) recover.
-    if (!C11_DISABLED && Date.now() < circuitOpenUntil) {
+    if (!C11_DISABLED && Date.now() < _embedCircuitOpenUntil) {
       await new Promise(r => setTimeout(r, 30000));  // wake every 30s to recheck
       continue;
     }
@@ -3594,15 +3626,15 @@ async function startEmbedLoop() {
           console.log(`[embed-loop] recovered after ${consecutiveFailures} consecutive failures`);
           consecutiveFailures = 0;
         }
-        if (!C11_DISABLED && circuitOpenUntil > 0) {
+        if (!C11_DISABLED && _embedCircuitOpenUntil > 0) {
           console.log('[embed-loop] circuit CLOSED — MLX embed recovered');
-          circuitOpenUntil = 0;
+          _embedCircuitOpenUntil = 0;
         }
       } else if (batchFailed) {
         consecutiveFailures++;
         // C11 D3: open circuit when streak crosses threshold.
-        if (!C11_DISABLED && consecutiveFailures >= C11_CIRCUIT_OPEN_STREAK && circuitOpenUntil === 0) {
-          circuitOpenUntil = Date.now() + C11_CIRCUIT_OPEN_MS;
+        if (!C11_DISABLED && consecutiveFailures >= C11_CIRCUIT_OPEN_STREAK && _embedCircuitOpenUntil === 0) {
+          _embedCircuitOpenUntil = Date.now() + C11_CIRCUIT_OPEN_MS;
           console.log(`[embed-loop] circuit OPEN for ${C11_CIRCUIT_OPEN_MS/1000}s (streak=${consecutiveFailures}) — pausing MLX calls to reduce memory pressure`);
         }
       } else if (embeddings && embeddings.length !== rows.length) {
@@ -3615,8 +3647,8 @@ async function startEmbedLoop() {
         consecutiveFailures++;
         console.log(`[embed-loop] mismatched response length (got ${embeddings.length}, expected ${rows.length}) — treating as failure`);
         // C11 D3: same circuit-open logic as ECONNRESET path.
-        if (!C11_DISABLED && consecutiveFailures >= C11_CIRCUIT_OPEN_STREAK && circuitOpenUntil === 0) {
-          circuitOpenUntil = Date.now() + C11_CIRCUIT_OPEN_MS;
+        if (!C11_DISABLED && consecutiveFailures >= C11_CIRCUIT_OPEN_STREAK && _embedCircuitOpenUntil === 0) {
+          _embedCircuitOpenUntil = Date.now() + C11_CIRCUIT_OPEN_MS;
           console.log(`[embed-loop] circuit OPEN for ${C11_CIRCUIT_OPEN_MS/1000}s (streak=${consecutiveFailures}) — pausing MLX calls to reduce memory pressure`);
         }
       }
