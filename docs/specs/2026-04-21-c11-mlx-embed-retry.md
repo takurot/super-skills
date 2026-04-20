@@ -126,6 +126,25 @@ triggers:
 Also snapshots `vm_stat` and process RSS at that moment.
 One-shot per 30-min TTL. Confirms the H5 theory empirically.
 
+**D8 — ATTACH leak guard (secondary cause cleanup)**: The three
+SSD-sync sites at lines 4700/4718/4755 use a single `dbExec(`...
+ATTACH ssd; INSERT ...; DETACH ssd; `)` pattern. When the
+middle INSERT fails (e.g. because of D7's mmap reclaim), the
+DETACH never fires, and the next iteration's ATTACH returns
+"database ssd is already in use" (43 × in the 30-min log
+sample). Compounds the chaos even after D1-D7 reduce the
+primary cause.
+
+Fix: wrap each ATTACH site in a try/catch/finally equivalent
+for SQL. Two options:
+  a. Split into 3 `dbExec` calls; use JS try/finally to ensure
+     DETACH runs even when the middle INSERT throws.
+  b. Use SQLite's SAVEPOINT + ROLLBACK TO — rollback auto-
+     detaches.
+
+Option (a) is simpler and doesn't change transaction semantics.
+~15 LOC change per site (× 3 sites = 45 LOC).
+
 ### Data model
 
 No schema changes. Uses:
@@ -204,9 +223,12 @@ embed-loop: SELECT 16 rows (backlog >5000 → 4 rows)
       one-shot `POST /admin/embed-unpoison` to reset sentinels.
 - [ ] 8. Add mmap-reclaim diagnostic wrapper in dbQuery
       first-error path (D7). Satisfies AC-C11-6.
-- [ ] 9. Add env-var rollback gate `VCTX_EMBED_C11_DISABLED=1`.
-- [ ] 10. Update OpenAPI for `/admin/embed-unpoison` (AC-8 sync).
-- [ ] 11. Add TDD harness `scripts/test-c11-embed-retry.sh`
+- [ ] 9. Wrap 3 ATTACH 'ssd' sites (lines 4700/4718/4755) with
+      try/finally so DETACH runs even on INSERT failure (D8).
+      Eliminates 43 × "already in use" secondary errors.
+- [ ] 10. Add env-var rollback gate `VCTX_EMBED_C11_DISABLED=1`.
+- [ ] 11. Update OpenAPI for `/admin/embed-unpoison` (AC-8 sync).
+- [ ] 12. Add TDD harness `scripts/test-c11-embed-retry.sh`
       covering:
       - timeout behavior (simulate slow MLX, confirm 60s abort)
       - circuit opens on streak ≥ 3
@@ -214,7 +236,9 @@ embed-loop: SELECT 16 rows (backlog >5000 → 4 rows)
       - /store doesn't block during circuit-open
       - backlog-adaptive batch size change
       - mmap-reclaim diagnostic fires once-per-30min
-- [ ] 12. Deploy, observe for 4 h, check SIGKILL-137 count delta
+      - ATTACH-leak scenario: force INSERT failure, next ATTACH
+        should succeed (not "already in use")
+- [ ] 13. Deploy, observe for 4 h, check SIGKILL-137 count delta
       (target: 0). Record in evolution-log.
 
 ### Estimated diff
