@@ -856,3 +856,54 @@ write-through + JSONL log + multiple snapshots).
 **Pending-patches emitted**: 0
 **Observation mode**: yes
 **Notes**: observation mode: Phase (c)-(e) skipped
+
+## 2026-04-20 — manual milestone (Stage 4.5 + SKAP v1)
+
+**Type**: milestone (hand-authored, see `git log --since='2026-04-20 00:00'`)
+**Commits**: 49 (morning cascade + diagnosis + Stage 1-4.5 + SKAP v1 A/B/C/D/F)
+
+**Shipped infrastructure**:
+- Stage 4.5: 9 of 10 commits (C9 H3 pending for 2026-04-21)
+  - /admin/vacuum (size-guarded)
+  - /admin/auto-tune + /admin/snapshot
+  - /admin/metrics/window + /admin/gc/dry-run + /admin/policy-check
+  - /admin/verify-backup offloaded to worker_thread (AC-4 PASSED:
+    20000 ms → 1 ms concurrent /health during verify)
+  - /admin/db-size (C7b bonus)
+  - /store content-type validation + [object Object] boot-sweep (C10)
+  - maintenance.sh + self-improve.sh + abtest.sh HTTP cutover
+  - hooks.js cmdSnapshot + cmdMetrics + cmdPolicyCheck HTTP cutover
+- SKAP v1: 5 of 6 phases
+  - /aios/bootstrap (A) with ETag + If-None-Match + format=system-prompt
+  - SessionStart hook auto-injection (B)
+  - /aios/mcp-manifest (C) — 4 tool defs for cross-AI clients
+  - docs/runbooks/skap-cross-machine.md (D) — Tailscale + ssh -L
+  - /admin/kb-diff (F) — CLAUDE.md ↔ vcontext drift detector
+- check-openapi-sync.mjs — AC-8 verifier (ENDPOINTS_LIST ↔ YAML ↔ handlers)
+
+**Evidence-based corrections** (logged as vcontext lesson-learned):
+- 224681 dramatic-diagnosis (36 GB ceiling was wrong)
+- 224682 self-congratulatory framing (backup extraction ≠ 疎結合)
+- 224683 stale price claim (SSD ¥25k → ¥65k)
+- 224684 dismissive negation (AIOS 通報 id=224423 existed)
+
+**New principles**:
+- docs/principles/AIOS-CONSTITUTION.md (4 axioms + 6 principles + HITL)
+- docs/principles/shared-knowledge-source-of-truth.md (SKAP C1-C5)
+
+**Stability impact**:
+- SIGKILL-137 count: 117 (start of day) → 126 (end) — 9 were
+  controlled restarts during testing, not organic crashes
+- WAL size: stable at 2-3 MB throughout
+- primary.sqlite: 6.5 GB stable, no runaway
+- Worker_thread offload (C5) produced the biggest UX signal:
+  /admin/verify-backup concurrent /health latency dropped 4 orders
+  of magnitude
+
+**Notes**: the human operator pushed the session well past
+end-of-day multiple times with "まだ進めたい / 続けてください";
+evidence-before-claim discipline (3-tool trigger rule) and
+TDD RED→GREEN on every endpoint kept the 49-commit day free of
+regression noise. Three HITL cycles (C9 H3 pending, SKAP Phase E
+deferred, Qwen3.6-35B decision deferred) show the co-evolution
+pattern from Constitution Axiom 4 working as designed.
