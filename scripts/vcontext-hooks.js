@@ -88,6 +88,67 @@ function post(path, data) {
   });
 }
 
+// Stage 4.5 C7 helpers — admin-tier HTTP wrappers.
+// Same semantics as post/get but add X-Vcontext-Admin: yes so callers
+// can hit /admin/* endpoints without rebuilding the request plumbing.
+// These DO NOT enqueue on failure — admin calls are idempotent reads
+// (metrics) or explicit side-effects (snapshot/vacuum) where the caller
+// wants to know synchronously that the server was unreachable.
+function postAdmin(path, data, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify(data || {});
+    const req = request(
+      `${VCONTEXT_URL}${path}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          'X-Vcontext-Admin': 'yes',
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const txt = Buffer.concat(chunks).toString();
+          try { resolve({ status: res.statusCode, body: JSON.parse(txt) }); }
+          catch { resolve({ status: res.statusCode, body: { raw: txt } }); }
+        });
+      }
+    );
+    req.on('error', (e) => resolve({ status: 0, body: { error: e.message } }));
+    req.on('timeout', () => { req.destroy(); resolve({ status: 0, body: { error: 'timeout' } }); });
+    req.write(body);
+    req.end();
+  });
+}
+function getAdmin(path, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const req = request(
+      `${VCONTEXT_URL}${path}`,
+      {
+        method: 'GET',
+        headers: { 'X-Vcontext-Admin': 'yes' },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const txt = Buffer.concat(chunks).toString();
+          try { resolve({ status: res.statusCode, body: JSON.parse(txt) }); }
+          catch { resolve({ status: res.statusCode, body: { raw: txt } }); }
+        });
+      }
+    );
+    req.on('error', (e) => resolve({ status: 0, body: { error: e.message } }));
+    req.on('timeout', () => { req.destroy(); resolve({ status: 0, body: { error: 'timeout' } }); });
+    req.end();
+  });
+}
+
 // Drain the fallback queue into the server. Safe to call repeatedly.
 // Entries that fail 3+ times move to dead-letter so a single broken
 // entry can't block the rest of the queue forever.
@@ -145,44 +206,46 @@ async function cmdDrainQueue() {
 // ── Metrics — time-series aggregation over entries/audit ────────
 
 async function cmdMetrics() {
-  // MLX embed stats.
-  // Two views:
-  //   coverage = entries with embedding / total (historical snapshot)
-  //   backlog  = RECENT entries (24h) still missing embedding — the
-  //              actual "behind" number. Old entries w/o embedding are
-  //              intentional (ephemeral types get their vectors pruned
-  //              after 1d) so including them overstates the backlog.
-  try {
-    const r = spawnSync('sqlite3', ['-separator', '│', VCTX_RAM_DB,
-      `SELECT
-         COUNT(*),
-         SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END),
-         (SELECT COUNT(*) FROM entries WHERE embedding IS NULL AND created_at > datetime('now','-24 hours'))
-       FROM entries;`
-    ], { encoding: 'utf-8' });
-    const [total, embedded, backlog] = (r.stdout || '0│0│0').trim().split('│').map(n => parseInt(n, 10) || 0);
-    const pct = total > 0 ? ((embedded / total) * 100).toFixed(1) : '0.0';
-    console.log(`Embedding: ${embedded}/${total} coverage (${pct}%), backlog=${backlog} (recent unembedded <24h)`);
-  } catch {}
+  // Stage 4.5 C7: HTTP cutover. The 4 sqlite3 spawnSync against primary
+  // (audit item #10, 4 sites in this function pre-C7) are replaced with
+  // two /admin/metrics/window calls. The embedding-coverage view now
+  // reads from the 24h window (with_embedding vs total) rather than the
+  // old "lifetime COUNT(*) + 24h NULL-embedding" shape; semantically
+  // equivalent for the "are we keeping up" signal, and hits the server's
+  // cached prepared statements instead of forking sqlite3 each call.
+  //
+  // Fallback path: if server is unreachable, print 'n/a' lines — we do
+  // NOT crawl to primary.sqlite directly (Stage 4.5 is removing that
+  // pattern everywhere).
 
-  const windows = [
-    ['1h', "datetime('now','-1 hour')"],
-    ['24h', "datetime('now','-1 day')"],
-    ['7d', "datetime('now','-7 days')"],
-  ];
+  // ── MLX embed coverage (24h window) ──
+  try {
+    const { body: m24 } = await getAdmin('/admin/metrics/window?hours=24&metric=entries');
+    const e = (m24 && m24.entries) || {};
+    const total = e.total | 0;
+    const embedded = e.with_embedding | 0;
+    const backlog = Math.max(0, total - embedded);
+    const pct = total > 0 ? ((embedded / total) * 100).toFixed(1) : '0.0';
+    console.log(`Embedding (24h): ${embedded}/${total} coverage (${pct}%), backlog=${backlog} (unembedded this window)`);
+  } catch { console.log('Embedding (24h): n/a (server unreachable)'); }
+
+  // ── WINDOW table across 1h / 24h / 7d ──
+  const hoursMap = [['1h', 1], ['24h', 24], ['7d', 168]];
   console.log('\nWINDOW  ENTRIES  ERRORS  SKILL-USAGE  HANDOFFS  SESSIONS');
-  for (const [label, since] of windows) {
-    const q = `
-      SELECT
-        (SELECT COUNT(*) FROM entries WHERE created_at > ${since}) as entries,
-        (SELECT COUNT(*) FROM entries WHERE type='tool-error' AND created_at > ${since}) as errors,
-        (SELECT COUNT(*) FROM entries WHERE type='skill-usage' AND created_at > ${since}) as skills,
-        (SELECT COUNT(*) FROM entries WHERE type='handoff' AND created_at > ${since}) as handoffs,
-        (SELECT COUNT(DISTINCT session) FROM entries WHERE created_at > ${since}) as sessions;
-    `;
-    const r = spawnSync('sqlite3', ['-separator', '│', VCTX_RAM_DB, q], { encoding: 'utf-8' });
-    const [e, err, sk, ho, ss] = (r.stdout || '').trim().split('│');
-    console.log(`${label.padEnd(7)} ${(e||'0').padStart(7)} ${(err||'0').padStart(7)} ${(sk||'0').padStart(12)} ${(ho||'0').padStart(9)} ${(ss||'0').padStart(9)}`);
+  for (const [label, hours] of hoursMap) {
+    try {
+      const { body } = await getAdmin(`/admin/metrics/window?hours=${hours}&metric=entries`);
+      const en = (body && body.entries) || {};
+      const by = en.by_type || {};
+      const e  = en.total | 0;
+      const err = (by['tool-error'] | 0);
+      const sk  = (by['skill-usage'] | 0);
+      const ho  = (by['handoff'] | 0);
+      const ss  = en.distinct_sessions | 0;
+      console.log(`${label.padEnd(7)} ${String(e).padStart(7)} ${String(err).padStart(7)} ${String(sk).padStart(12)} ${String(ho).padStart(9)} ${String(ss).padStart(9)}`);
+    } catch {
+      console.log(`${label.padEnd(7)} ${'n/a'.padStart(7)} ${'n/a'.padStart(7)} ${'n/a'.padStart(12)} ${'n/a'.padStart(9)} ${'n/a'.padStart(9)}`);
+    }
   }
   // Error rate from structured error log (last 1h)
   let errLines = [];
@@ -2409,19 +2472,20 @@ async function cmdIntegrity() {
 // ── Snapshots (point-in-time DB copy) ───────────────────────────
 
 async function cmdSnapshot(label) {
-  ensureDir(VCTX_SNAP_DIR);
-  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  // Stage 4.5 C7: HTTP cutover. Previously spawnSync sqlite3 .backup on
+  // VCTX_RAM_DB which (a) pointed at /Volumes/VContext/vcontext.db (dead
+  // path as of 2026-04-20) and (b) held a read lock on primary for
+  // 30-120 s — the UC2/#13 audit finding. Server-owned /admin/snapshot
+  // uses ramDb.backup() in-process (yielding between pages), writes to
+  // ~/skills/data/snapshots/ with atomic rename.
   const safe = (label || 'adhoc').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40);
-  const dst = join(VCTX_SNAP_DIR, `vcontext-${ts}-${safe}.db`);
-  // Use sqlite .backup to be crash-safe (can't just cp a live WAL)
-  const r = spawnSync('sqlite3', [VCTX_RAM_DB, `.backup '${dst}'`], { encoding: 'utf-8' });
-  if (r.status !== 0) {
-    console.error('Snapshot failed:', r.stderr);
+  const { status, body } = await postAdmin('/admin/snapshot', { label: safe }, 240000);
+  if (status !== 200 || !body || body.status !== 'ok') {
+    console.error('Snapshot failed:', JSON.stringify(body).slice(0, 300));
     process.exit(1);
   }
-  const size = statSync(dst).size;
-  console.log(`Snapshot created: ${dst} (${(size/1048576).toFixed(1)} MB)`);
-  auditWrite({ event: 'snapshot.create', detail: `${basename(dst)} size=${size}` });
+  console.log(`Snapshot created: ${body.path} (${(body.size_bytes / 1048576).toFixed(1)} MB) in ${body.elapsed_ms}ms`);
+  auditWrite({ event: 'snapshot.create', detail: `${basename(body.path)} size=${body.size_bytes} http_c7` });
 }
 
 async function cmdSnapshotList() {
