@@ -43,6 +43,16 @@ const IDLE_MS       = parseInt(process.env.VCTX_MLX_IDLE_MS || String(10 * 60 * 
 const WARMUP_MS_MAX = parseInt(process.env.VCTX_MLX_WARMUP_MS_MAX || '90000', 10);
 const POLL_INTERVAL = parseInt(process.env.VCTX_MLX_POLL_MS || '3000', 10);
 const MIN_FREE_PAGES = parseInt(process.env.VCTX_MLX_MIN_FREE_PAGES || '50000', 10);
+// M2 (2026-04-20): KV-cache eviction threshold.
+// Qwen3-8B-4bit grows prompt_cache linearly with sequences (no LRU
+// eviction). After N requests we force bootout + bootstrap to reset
+// cache to 0. Threshold 10 caps peak cache at ~10 GB (half of
+// observed 22 GB runaway from 2026-04-20 log). Set VCTX_MLX_MAX_
+// REQUESTS_PER_CACHE=0 to disable (keep old behavior).
+// Quality preserved — maxTokens is NOT touched.
+const MAX_REQUESTS_PER_CACHE = parseInt(
+  process.env.VCTX_MLX_MAX_REQUESTS_PER_CACHE || '10', 10
+);
 
 // ── State machine ────────────────────────────────────────────────
 
@@ -54,6 +64,14 @@ const state = {
   active_requests: 0,
   warm_up_ms_last: null,
   starting_promise: /** @type {Promise<void>|null} */ (null),
+  // M2 (2026-04-20): KV-cache eviction counter. Qwen3-8B-4bit's
+  // prompt_cache grows ~1.4-1.7 GB per sequence with no eviction
+  // (observed in /tmp/mlx-generate-server.log: 0 → 22 GB over 20
+  // sequences, then jetsam). After N requests, we bootout to force
+  // MLX to restart with a fresh cache; next request re-warms.
+  // Threshold chosen to keep peak cache under ~10 GB (half of the
+  // observed runaway). Target: 0 SIGKILL-137 from this vector.
+  requests_since_bootstrap: 0,
   metrics: {
     bootstraps: 0,
     bootouts: 0,
@@ -61,6 +79,7 @@ const state = {
     requests_503_memory: 0,
     requests_503_warmup_timeout: 0,
     warmup_latencies_ms: /** @type {number[]} */ ([]),
+    cache_evictions: 0,
   },
 };
 
@@ -262,12 +281,14 @@ async function startMlx() {
 
     state.value = 'RUNNING';
     state.warm_up_ms_last = warmupMs;
+    // M2: fresh process = fresh cache. Reset counter.
+    state.requests_since_bootstrap = 0;
     state.metrics.warmup_latencies_ms.push(warmupMs);
     // Keep the latencies array bounded
     if (state.metrics.warmup_latencies_ms.length > 100) {
       state.metrics.warmup_latencies_ms.shift();
     }
-    logLine(`MLX RUNNING after ${warmupMs}ms warm-up`);
+    logLine(`MLX RUNNING after ${warmupMs}ms warm-up (cache reset)`);
   })();
 
   state.starting_promise = p;
@@ -414,6 +435,26 @@ async function handleRequest(req, res) {
   try {
     const bodyBuf = await readBody(req);
 
+    // M2: KV-cache eviction. If this MLX process has served
+    // >= MAX_REQUESTS_PER_CACHE requests, force a fresh restart to
+    // reset the prompt cache. Quality IS preserved — maxTokens
+    // unchanged. Only the cached KVs are dropped; the model reloads
+    // identical weights. Trade-off: one warm-up per N requests
+    // (~15-60s) vs unbounded cache growth (→ 22 GB → SIGKILL).
+    // Evidence: /tmp/mlx-generate-server.log shows 0 → 22 GB over
+    // 20 sequences pre-M2; threshold 10 keeps peak ~10 GB.
+    // Intent: maxTokens=40960 stays (user-confirmed quality lever);
+    // this is the correct lever to address KV-cache runaway.
+    if (MAX_REQUESTS_PER_CACHE > 0
+        && state.value === 'RUNNING'
+        && state.requests_since_bootstrap >= MAX_REQUESTS_PER_CACHE
+        && state.active_requests === 1  /* only this req is live */) {
+      logLine(`M2 cache eviction: ${state.requests_since_bootstrap} reqs served, bootout + restart`);
+      state.metrics.cache_evictions++;
+      try { await stopMlx('M2-cache-eviction'); } catch (e) { logLine('M2 stop failed:', e.message); }
+      // state.value is now STOPPED; next block will bootstrap.
+    }
+
     if (state.value !== 'RUNNING') {
       // Will throw if memory tight or warmup times out
       try {
@@ -432,6 +473,7 @@ async function handleRequest(req, res) {
     }
 
     state.metrics.requests_forwarded++;
+    state.requests_since_bootstrap++;
     await forwardToMlx(req, res, bodyBuf);
   } catch (e) {
     logLine('handler error:', e.message);
