@@ -6570,6 +6570,8 @@ const ENDPOINTS_LIST = [
   'POST   /admin/backup             — trigger a .backup() snapshot of primary → BACKUP_PATH (rate-limited 1/60s, in-flight guard)',
   'POST   /admin/wal-checkpoint     — run PRAGMA wal_checkpoint(mode) on primary {mode?: "PASSIVE"|"FULL"|"RESTART"|"TRUNCATE"} (default: TRUNCATE)',
   'POST   /admin/vacuum             — VACUUM primary (size-guarded, rate-limited 1/7d) {target?:"primary"|"backup",force?:bool}; deferred if DB>VCTX_VACUUM_MAX_BYTES (default 512MiB) unless force+VCTX_VACUUM_ALLOW_LARGE=1; backup target not yet implemented',
+  'POST   /admin/auto-tune          — ensure critical indexes + ANALYZE {analyze?:bool,ensure_indexes?:bool,force?:bool} (rate-limited 1/h)',
+  'POST   /admin/snapshot           — ramDb.backup() to ~/skills/data/snapshots/<label>-<ts>.db {label:string,include_wal?:bool,force?:bool} (rate-limited 1/10min/label, in-flight guard)',
 ];
 
 const server = createServer(async (req, res) => {
@@ -7963,6 +7965,296 @@ const server = createServer(async (req, res) => {
         } catch { /* non-fatal */ }
 
         sendJson(res, 200, result);
+      } catch (e) {
+        sendJson(res, 500, { status: 'fail', error: e.message });
+      }
+    } else if (method === 'POST' && path === '/admin/auto-tune') {
+      // Stage 4.5 Commit C3 (spec §3.2.4). Replaces
+      // vcontext-maintenance.sh:137-149 CREATE INDEX + ANALYZE block
+      // (audit #14). Runs on the server's own ramDb — no external lock.
+      //
+      // Body: { analyze?: bool (default true), ensure_indexes?: bool (default true) }
+      // Returns: { status, indexes_created, analyze_elapsed_ms, ran_at }
+      //
+      // Rate-limit: 1/hour via admin-auto-tune-run entries.
+      // force=true in body bypasses rate gate (for manual reruns).
+      if (req.headers['x-vcontext-admin'] !== 'yes') {
+        return sendJson(res, 403, {
+          error: 'X-Vcontext-Admin: yes header required for admin operations',
+        });
+      }
+      try {
+        const body = (await readBody(req)) || {};
+        const doAnalyze = body.analyze !== false;
+        const doIndexes = body.ensure_indexes !== false;
+        const force = body.force === true;
+        if (!ramDb) {
+          return sendJson(res, 503, { status: 'skipped', reason: 'ramdb_unavailable' });
+        }
+
+        // Rate-limit check.
+        const RATE_LIMIT_MS = 60 * 60 * 1000; // 1 hour
+        let recent;
+        try {
+          recent = ramDb.prepare(
+            `SELECT created_at FROM entries
+             WHERE type = 'admin-auto-tune-run'
+             ORDER BY id DESC LIMIT 1`
+          ).get();
+        } catch { recent = null; }
+        if (recent && !force) {
+          const lastMs = Date.parse(recent.created_at.replace(' ', 'T') + 'Z');
+          const age = Date.now() - (Number.isFinite(lastMs) ? lastMs : 0);
+          if (age < RATE_LIMIT_MS) {
+            return sendJson(res, 200, {
+              status: 'skipped',
+              reason: 'recent_tune',
+              last_ran_at: recent.created_at,
+              age_ms: age,
+              retry_after_ms: RATE_LIMIT_MS - age,
+              indexes_created: 0,
+              analyze_elapsed_ms: 0,
+            });
+          }
+        }
+
+        // Canonical index list (lifted from maintenance.sh:137-149 — the
+        // dead path we are replacing). If new indexes are needed, add
+        // them here; idempotent via IF NOT EXISTS.
+        const INDEX_STATEMENTS = [
+          { name: 'idx_entries_embedding_null',
+            sql: "CREATE INDEX IF NOT EXISTS idx_entries_embedding_null ON entries(id) WHERE embedding IS NULL" },
+          { name: 'idx_entries_type_created',
+            sql: "CREATE INDEX IF NOT EXISTS idx_entries_type_created ON entries(type, created_at DESC)" },
+          { name: 'idx_entries_session_id',
+            sql: "CREATE INDEX IF NOT EXISTS idx_entries_session_id ON entries(session, id DESC)" },
+        ];
+
+        let indexesCreated = 0;
+        if (doIndexes) {
+          // Enumerate existing indexes to report how many we actually
+          // added (vs. pre-existing idempotent no-ops).
+          let existingIndexes = new Set();
+          try {
+            const rows = ramDb.prepare(
+              "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'"
+            ).all();
+            existingIndexes = new Set(rows.map(r => r.name));
+          } catch { /* ignore */ }
+          for (const ix of INDEX_STATEMENTS) {
+            if (!existingIndexes.has(ix.name)) {
+              try {
+                ramDb.exec(ix.sql);
+                indexesCreated++;
+              } catch { /* per-index failure is non-fatal */ }
+            }
+          }
+        }
+
+        let analyzeElapsed = 0;
+        if (doAnalyze) {
+          const aT = Date.now();
+          try { ramDb.exec('ANALYZE;'); } catch { /* non-fatal */ }
+          analyzeElapsed = Date.now() - aT;
+        }
+
+        const result = {
+          status: 'ok',
+          indexes_created: indexesCreated,
+          analyze_elapsed_ms: analyzeElapsed,
+          analyzed: doAnalyze,
+          indexes_ensured: doIndexes,
+          ran_at: new Date().toISOString(),
+        };
+
+        // Persist for rate-limit gate.
+        try {
+          ramDb.prepare(
+            `INSERT INTO entries (type, content, tags, session, token_estimate, created_at, content_hash)
+             VALUES ('admin-auto-tune-run', ?, ?, 'admin-op', ?, datetime('now'), ?)`
+          ).run(
+            JSON.stringify(result),
+            JSON.stringify(['admin-op', 'op:auto-tune']),
+            Math.ceil(JSON.stringify(result).length / 4),
+            require('node:crypto').createHash('sha256')
+              .update(`auto-tune:${Date.now()}`).digest('hex'),
+          );
+        } catch { /* non-fatal */ }
+
+        sendJson(res, 200, result);
+      } catch (e) {
+        sendJson(res, 500, { status: 'fail', error: e.message });
+      }
+    } else if (method === 'POST' && path === '/admin/snapshot') {
+      // Stage 4.5 Commit C3 (spec §3.2.1). Replaces
+      // vcontext-hooks.js:2408 cmdSnapshot → spawnSync('sqlite3',
+      // [VCTX_RAM_DB, '.backup', dst]) (audit UC2/#13).
+      //
+      // Body: { label: string (required), include_wal?: bool, force?: bool }
+      // Returns: { status, label, path, size_bytes, elapsed_ms, ran_at }
+      //
+      // Rate-limit: 1 per 10 min per label (force bypasses).
+      // In-flight guard: prevents parallel snapshot() calls (each copies
+      // the full 6.7 GB DB — two at once saturates IO for minutes).
+      if (req.headers['x-vcontext-admin'] !== 'yes') {
+        return sendJson(res, 403, {
+          error: 'X-Vcontext-Admin: yes header required for admin operations',
+        });
+      }
+      try {
+        const body = (await readBody(req)) || {};
+        const label = (body.label && typeof body.label === 'string') ? body.label.trim() : '';
+        const force = body.force === true;
+
+        // Validate label: alphanum + underscore + hyphen only, 1-64 chars.
+        // Prevents path traversal (../../etc/passwd), null bytes, etc.
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(label)) {
+          return sendJson(res, 400, {
+            error: 'Invalid label. Must match /^[A-Za-z0-9_-]{1,64}$/',
+            received: label,
+          });
+        }
+        if (!ramDb) {
+          return sendJson(res, 503, { status: 'skipped', reason: 'ramdb_unavailable' });
+        }
+
+        // In-flight guard (snapshots of 6.7 GB stack badly).
+        const inflightKey = '_snapshotInFlight';
+        if (globalThis[inflightKey]) {
+          return sendJson(res, 429, {
+            status: 'busy',
+            reason: 'snapshot_already_running',
+            hint: 'wait for current snapshot to complete before retrying',
+          });
+        }
+
+        // Rate-limit check.
+        const RATE_LIMIT_MS = 10 * 60 * 1000; // 10 min per label
+        const labelTag = `"label:${label}"`;
+        let recent;
+        try {
+          recent = ramDb.prepare(
+            `SELECT created_at FROM entries
+             WHERE type = 'admin-snapshot-run'
+               AND tags LIKE '%' || ? || '%'
+             ORDER BY id DESC LIMIT 1`
+          ).get(labelTag);
+        } catch { recent = null; }
+        if (recent && !force) {
+          const lastMs = Date.parse(recent.created_at.replace(' ', 'T') + 'Z');
+          const age = Date.now() - (Number.isFinite(lastMs) ? lastMs : 0);
+          if (age < RATE_LIMIT_MS) {
+            return sendJson(res, 429, {
+              status: 'skipped',
+              label,
+              reason: 'recent_snapshot',
+              last_ran_at: recent.created_at,
+              age_ms: age,
+              retry_after_ms: RATE_LIMIT_MS - age,
+            });
+          }
+        }
+
+        const fsMod = require('node:fs');
+        const pathMod = require('node:path');
+        const SNAP_DIR = pathMod.join(process.env.HOME, 'skills', 'data', 'snapshots');
+        try { fsMod.mkdirSync(SNAP_DIR, { recursive: true }); } catch { /* ignore */ }
+
+        // Filename: <label>-<YYYYMMDD-HHmm>.db
+        const now = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth()+1)}${pad(now.getUTCDate())}-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}`;
+        const destName = `${label}-${stamp}.db`;
+        const destPath = pathMod.join(SNAP_DIR, destName);
+        const tmpPath = destPath + '.tmp';
+
+        // Clean up any stale tmp from a prior crashed attempt.
+        for (const suffix of ['', '-wal', '-shm', '-journal']) {
+          try { fsMod.unlinkSync(tmpPath + suffix); } catch { /* ignore */ }
+        }
+
+        globalThis[inflightKey] = true;
+        try {
+          const startT = Date.now();
+          try {
+            await ramDb.backup(tmpPath);
+          } catch (e) {
+            for (const suffix of ['', '-wal', '-shm', '-journal']) {
+              try { fsMod.unlinkSync(tmpPath + suffix); } catch { /* ignore */ }
+            }
+            return sendJson(res, 500, {
+              status: 'fail',
+              label,
+              reason: 'backup_failed',
+              detail: e.message,
+            });
+          }
+
+          // Size sanity before promotion.
+          let sizeBytes = 0;
+          try { sizeBytes = fsMod.statSync(tmpPath).size; } catch { /* ignore */ }
+          if (sizeBytes <= 0) {
+            try { fsMod.unlinkSync(tmpPath); } catch { /* ignore */ }
+            return sendJson(res, 500, {
+              status: 'fail',
+              label,
+              reason: 'zero_byte_snapshot',
+            });
+          }
+
+          // Truncate WAL in the tmp so the promoted file is self-contained
+          // (one-file snapshot, portable). Skip if include_wal=true.
+          if (body.include_wal !== true) {
+            try {
+              const tmpDb = new Database(tmpPath);
+              tmpDb.pragma('wal_checkpoint(TRUNCATE)');
+              tmpDb.close();
+            } catch { /* non-fatal — snapshot still usable */ }
+          }
+
+          // Atomic rename into final slot.
+          try {
+            fsMod.renameSync(tmpPath, destPath);
+          } catch (e) {
+            try { fsMod.unlinkSync(tmpPath); } catch { /* ignore */ }
+            return sendJson(res, 500, {
+              status: 'fail',
+              label,
+              reason: 'rename_failed',
+              detail: e.message,
+            });
+          }
+
+          // Re-stat after rename in case truncate changed size.
+          try { sizeBytes = fsMod.statSync(destPath).size; } catch { /* ignore */ }
+
+          const result = {
+            status: 'ok',
+            label,
+            path: destPath,
+            size_bytes: sizeBytes,
+            elapsed_ms: Date.now() - startT,
+            ran_at: new Date().toISOString(),
+          };
+
+          // Persist for rate-limit gate.
+          try {
+            ramDb.prepare(
+              `INSERT INTO entries (type, content, tags, session, token_estimate, created_at, content_hash)
+               VALUES ('admin-snapshot-run', ?, ?, 'admin-op', ?, datetime('now'), ?)`
+            ).run(
+              JSON.stringify(result),
+              JSON.stringify(['admin-op', 'op:snapshot', `label:${label}`]),
+              Math.ceil(JSON.stringify(result).length / 4),
+              require('node:crypto').createHash('sha256')
+                .update(`snapshot:${label}:${startT}`).digest('hex'),
+            );
+          } catch { /* non-fatal */ }
+
+          sendJson(res, 200, result);
+        } finally {
+          globalThis[inflightKey] = false;
+        }
       } catch (e) {
         sendJson(res, 500, { status: 'fail', error: e.message });
       }

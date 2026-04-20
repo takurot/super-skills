@@ -2459,6 +2459,131 @@ paths:
         '500':
           description: Unexpected failure.
 
+  /admin/auto-tune:
+    post:
+      tags: [admin]
+      operationId: adminAutoTune
+      summary: Ensure critical indexes exist and refresh ANALYZE statistics
+      description: |
+        Stage 4.5 Commit C3 (spec §3.2.4). Replaces
+        vcontext-maintenance.sh:137-149 CREATE INDEX + ANALYZE block.
+
+        Runs on the server's own ramDb — no external file lock.
+        Idempotent: CREATE INDEX IF NOT EXISTS + ANALYZE.
+
+        Canonical index list (2026-04-20):
+          - idx_entries_embedding_null ON entries(id) WHERE embedding IS NULL
+          - idx_entries_type_created ON entries(type, created_at DESC)
+          - idx_entries_session_id ON entries(session, id DESC)
+
+        Rate-limit: 1/hour via admin-auto-tune-run entries.
+        force=true in body bypasses the rate gate.
+      security:
+        - BearerAuth: []
+          AdminHeader: []
+      parameters:
+        - in: header
+          name: X-Vcontext-Admin
+          required: true
+          schema: { type: string, enum: [yes] }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                analyze: { type: boolean, default: true }
+                ensure_indexes: { type: boolean, default: true }
+                force: { type: boolean, default: false, description: bypass 1/hour rate gate }
+      responses:
+        '200':
+          description: Auto-tune result or rate-limit skip.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok, skipped] }
+                  indexes_created: { type: integer }
+                  analyze_elapsed_ms: { type: integer }
+                  analyzed: { type: boolean }
+                  indexes_ensured: { type: boolean }
+                  ran_at: { type: string, format: date-time }
+                  reason: { type: string }
+                  last_ran_at: { type: string, format: date-time }
+                  age_ms: { type: integer }
+                  retry_after_ms: { type: integer }
+        '403':
+          description: Missing X-Vcontext-Admin header.
+        '503':
+          description: ramDb not available.
+
+  /admin/snapshot:
+    post:
+      tags: [admin]
+      operationId: adminSnapshot
+      summary: Create a labeled snapshot of primary via ramDb.backup()
+      description: |
+        Stage 4.5 Commit C3 (spec §3.2.1). Replaces
+        vcontext-hooks.js:2408 cmdSnapshot → spawnSync('sqlite3', ...) pattern.
+
+        Writes to ~/skills/data/snapshots/<label>-<YYYYMMDD-HHmm>.db via
+        better-sqlite3 online backup (yields event loop between pages).
+        Atomic rename from .tmp. WAL truncated on the tmp before rename
+        unless include_wal=true.
+
+        Label validation: /^[A-Za-z0-9_-]{1,64}$/ — blocks path traversal.
+        Rate-limit: 1 per 10 min per label (force=true bypasses).
+        In-flight guard: 429 if another snapshot is currently copying.
+      security:
+        - BearerAuth: []
+          AdminHeader: []
+      parameters:
+        - in: header
+          name: X-Vcontext-Admin
+          required: true
+          schema: { type: string, enum: [yes] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [label]
+              properties:
+                label:
+                  type: string
+                  pattern: '^[A-Za-z0-9_-]{1,64}$'
+                  description: 'alphanumeric + underscore + hyphen, 1-64 chars'
+                include_wal: { type: boolean, default: false }
+                force: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Snapshot written to disk.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+                  label: { type: string }
+                  path: { type: string }
+                  size_bytes: { type: integer }
+                  elapsed_ms: { type: integer }
+                  ran_at: { type: string, format: date-time }
+        '400':
+          description: Invalid or missing label.
+        '403':
+          description: Missing X-Vcontext-Admin header.
+        '429':
+          description: |
+            Rate-limited (skipped with reason=recent_snapshot) or
+            in-flight (reason=snapshot_already_running).
+        '500':
+          description: backup_failed / zero_byte_snapshot / rename_failed.
+        '503':
+          description: ramdb_unavailable.
+
   /admin/fts-full-rebuild:
     post:
       tags: [admin]
