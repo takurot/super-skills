@@ -261,3 +261,118 @@ launchctl disable gui/$(id -u)/com.vcontext.mlx-generate
 
 *End of 2026-04-20. AIOS admin endpoint trio is live, Stage 4.5
 fully speced, next session has a clear 9-commit path to LLM recovery.*
+
+---
+
+## Evening-2 addition (2026-04-20 23:06 JST) — H6/H7 rejected, H8 pending
+
+Updated priority: **FIRST read docs/analysis/phase-c11-d8-review.md + this
+section**. The earlier handoff recommendation order is now partially
+obsolete based on new evidence.
+
+### What definitively shipped today (66 commits total)
+
+- C11 minimum + bc4c299 + M2 proxy fix + --prompt-cache-size 8 + D8 ATTACH leak
+- SKAP A/B/C/D/F, Stage 4.5 C2-C8+C10, many analysis docs
+- vcontext decisions stored: id=229441, 229475, 229515 (user-authored principles)
+- LLM recovery operational (Qwen3-8B-4bit + draft speculative)
+- Search (FTS + semantic) and LLM generate both verified live
+
+### Crash rate — honest measurement
+
+- Pre-C11 baseline: 96 crashes/h
+- **Post-bc4c299 measured**: 1 crash in 15 min = **4 crashes/h**
+- **Improvement: 24× reduction, but NOT zero**
+- Session total crashes today: 126 → 139 = 13 new crashes
+
+### Evidence that overturned prior hypotheses
+
+**H5 (mlx-embed retry storm)**: RESOLVED by C11. Zero `file is not a database`
+errors post-fix, zero `already in use` errors post-D8. These were real root
+causes — fixed.
+
+**H6 (concurrent MLX-generate loop pileup)**: FALSIFIED by agent 4 code read.
+`_mlxQueue` at server.js:5504-5565 serializes ALL MLX calls; can't pile up
+at the proxy layer.
+
+**H7 (KV cache growth → memory pressure → SIGKILL)**: PARTIALLY FIXED.
+`--prompt-cache-size 8` caps cache effectively (verified 1-2 seq observed,
+never 3+ during today's monitor). BUT crashes CONTINUE at low cache:
+  - 2026-04-20 23:04 crash: PID 21404, RSS 234MB, MLX 151MB, cache 1 seq,
+    memory available 7.7GB. **No pressure present**. H7 is insufficient.
+
+**H8 (predict handler concurrent/reentrant)**: NEW, UNVERIFIED. Pre-crash
+log pattern repeatedly shows:
+  ```
+  [vcontext:predict] handler entered, prompt_len=30
+  [vcontext:predict] handler entered, prompt_len=30   ← duplicate
+  [vcontext:predict] handler entered, prompt_len=35
+  [vcontext:predict] handler entered, prompt_len=35   ← duplicate
+  [wrapper] Server exited with code 137
+  ```
+The duplicate `handler entered` suggests concurrent or re-entrant calls
+despite `_mlxQueue` serialization at generate. Either predict has its own
+pre-queue code path, or the "handler entered" log is printed before queue
+entry. Either way, the correlation with SIGKILL is consistent.
+
+### Tomorrow's investigation plan (investigate skill discipline)
+
+Do NOT apply speculative fixes first. Gather evidence:
+
+1. **Code trace**: grep `handler entered` in server.js. Understand which
+   code prints that line and what happens between the two entries.
+   Candidate files: `runOnePrediction`, its callers.
+
+2. **H8 verification**: set `VCTX_PREDICT_DISABLED=1` env (add if needed)
+   and restart. Observe 15-30 min. If SIGKILL rate drops to 0 → predict
+   loop is confirmed as trigger. If rate unchanged → H8 falsified.
+
+3. **Non-memory-pressure SIGKILL source**: what else can SIGKILL a process
+   on macOS besides memory pressure?
+   - OOM killer: ruled out (crash at low RSS)
+   - jetsam: plist has unlimited, ruled out earlier (docs/analysis/
+     2026-04-20-nightly-organic-crash-pattern.md)
+   - Kernel panic: would affect whole system (not just vcontext)
+   - Signal from another process: who could send SIGKILL?
+   - Watchdog: `com.vcontext.watchdog` — **worth investigating**
+     Does watchdog send SIGKILL on some condition?
+
+4. **Prior vcontext-watchdog.sh logic**: grep for `kill|pkill|signal` in
+   watchdog script. It may have a health-check that triggers SIGKILL
+   on slow /health response — exactly the class we'd see during
+   predict handler bursts.
+
+### Monitor bug caught (meta-lesson)
+
+My monitoring `pgrep -f vcontext-server.js` was matching the monitor's
+OWN shell command line because the literal string appeared there. Buggy
+monitor reported 28-min uptime on PID 9097 (my own zsh, 1.7KB RSS) while
+the real vcontext (PID 21404, 279MB RSS, different uptime) was crashing
+unobserved.
+
+Lesson: `pgrep -f PATTERN` is too broad. Use tight pattern like
+`"node .*vcontext-server\.js"` to match only node children, not shells
+running scripts that mention the file. Recorded in vcontext as lesson-
+learned candidate for next session.
+
+### vcontext decisions captured today (available via /recall)
+
+- id=229441 — maxTokens=40960 is user-intentional (quality). Do not
+  lower. Cache overflow must be addressed via eviction (M2), not
+  token count reduction. Approved_by: user.
+- id=229475 — AIOS = infinite memory × infinite skills × infinite growth.
+  Any fix must preserve unbounded learning capacity.
+- id=229515 — AIOS changes thinking approach, learns from mistakes and
+  failures. Mistakes must be captured as decisions so the next session
+  doesn't repeat them.
+
+### Recommended 2026-04-21 startup sequence
+
+1. Read this evening-2 section + phase-c11-d8-review.md
+2. Read vcontext decisions 229441/229475/229515 via /recall?q=decision
+3. Run `scripts/crash-pattern-report.sh --window 2h` to establish
+   current steady-state
+4. Start H8 investigation (code trace first, no fix yet)
+5. After H8 understood, decide: apply env-gate disable test, or fix
+   directly
+
