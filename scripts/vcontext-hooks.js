@@ -299,10 +299,12 @@ async function cmdPolicyCheck() {
     console.log(`  ⚠ Dead-letter queue: ${dlCount} abandoned entries`);
     violations++;
   }
-  // 4) Recent tool-errors spike
-  const r = spawnSync('sqlite3', [VCTX_RAM_DB,
-    `SELECT COUNT(*) FROM entries WHERE type='tool-error' AND created_at > datetime('now','-1 hour');`], { encoding: 'utf-8' });
-  const toolErrors = parseInt((r.stdout || '0').trim(), 10) || 0;
+  // 4) Recent tool-errors spike — Stage 4.5 C7b: HTTP cutover.
+  let toolErrors = 0;
+  try {
+    const { body: m1 } = await getAdmin('/admin/metrics/window?hours=1&metric=entries');
+    toolErrors = ((m1 && m1.entries && m1.entries.by_type) || {})['tool-error'] | 0;
+  } catch { /* non-fatal */ }
   if (toolErrors > 20) {
     console.log(`  ⚠ Tool error spike: ${toolErrors} in last hour`);
     violations++;
@@ -325,26 +327,29 @@ async function cmdPolicyCheck() {
       }
     }
   } catch {}
-  // 6) RAM disk DB size — 4GB cap, alert at 75%
+  // 6) RAM disk DB size — Stage 4.5 C7b: HTTP cutover via /admin/db-size.
+  //    Threshold unchanged (alert approaching 3 GB), but the data
+  //    source is now the server's in-process PRAGMA rather than a
+  //    fork/exec of sqlite3 CLI on primary.
+  //    NOTE: use Number() coercion, NOT `| 0`. Bitwise OR truncates
+  //    to int32; primary.sqlite currently ~7 GB (7×10^9 > 2^31).
   try {
-    const r2 = spawnSync('sqlite3', [VCTX_RAM_DB, 'PRAGMA page_size; PRAGMA page_count;'], { encoding: 'utf-8' });
-    const [ps, pc] = (r2.stdout || '').trim().split('\n').map(n => parseInt(n, 10));
-    if (ps && pc) {
-      const dbMB = (ps * pc) / 1048576;
-      if (dbMB > 3072) { // 3 GB of 4 GB cap
-        console.log(`  ⚠ RAM disk DB ${dbMB.toFixed(0)}MB (approaching 4GB cap)`);
+    const { body: ds } = await getAdmin('/admin/db-size');
+    const bytes = Number((ds && ds.pages && ds.pages.bytes) || 0);
+    if (bytes > 0) {
+      const dbMB = bytes / 1048576;
+      if (dbMB > 3072) {
+        console.log(`  ⚠ DB size ${dbMB.toFixed(0)}MB (approaching 4GB cap)`);
         violations++;
       }
     }
   } catch {}
-  // 7) Tier balance — RAM/SSD ratio. Steady state should be <60% RAM;
-  //    higher means tier migration is falling behind and the small 4GB
-  //    RAM disk will fill before work cycles complete.
+  // 7) Tier balance — Stage 4.5 C7b: HTTP cutover via /tier/stats.
+  //    Existing endpoint /tier/stats returns RAM+SSD counts server-side.
   try {
-    const r3 = spawnSync('sqlite3', [VCTX_RAM_DB, 'SELECT COUNT(*) FROM entries;'], { encoding: 'utf-8' });
-    const r4 = spawnSync('sqlite3', [VCTX_SSD_DB, 'SELECT COUNT(*) FROM entries;'], { encoding: 'utf-8' });
-    const ram = parseInt((r3.stdout||'0').trim(),10)||0;
-    const ssd = parseInt((r4.stdout||'0').trim(),10)||0;
+    const ts = await get('/tier/stats');
+    const ram = ts?.ram?.count | 0;
+    const ssd = ts?.ssd?.count | 0;
     const total = ram + ssd;
     if (total > 0) {
       const pct = (ram / total) * 100;
@@ -355,16 +360,15 @@ async function cmdPolicyCheck() {
       }
     }
   } catch {}
-  // 8) Secret-pattern scan — high-entropy / known-prefix tokens in
-  //    recent content that shouldn't be there. False positives are
-  //    accepted; better to audit than silently leak.
+  // 8) Secret-pattern scan — Stage 4.5 C7b: HTTP cutover via
+  //    /admin/policy-check (which includes secret-scan). Server
+  //    runs the regex inside its own ramDb connection, we just
+  //    inspect the finding.
   try {
-    const r5 = spawnSync('sqlite3', [VCTX_RAM_DB,
-      `SELECT COUNT(*) FROM entries WHERE created_at > datetime('now','-1 hour')
-         AND (content LIKE '%sk-%' OR content LIKE '%ghp_%' OR content LIKE '%Bearer eyJ%'
-              OR content LIKE '%AKIA%' OR content GLOB '*[A-Za-z0-9]{40,}*');`
-    ], { encoding: 'utf-8' });
-    const n = parseInt((r5.stdout||'0').trim(),10)||0;
+    const { body: pc } = await postAdmin('/admin/policy-check',
+      { checks: ['secret-scan'], window_hours: 1 });
+    const finding = (pc?.findings || []).find(f => f.check === 'secret-scan');
+    const n = finding?.count | 0;
     if (n > 0) {
       console.log(`  ⚠ ${n} entries in last hour match known-secret patterns — review and redact`);
       violations++;

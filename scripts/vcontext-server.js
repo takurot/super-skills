@@ -6608,6 +6608,7 @@ const ENDPOINTS_LIST = [
   'POST   /admin/gc/dry-run         — report GC candidates (read-only) {embedding_prune_days?:N,include_types?:[...]}',
   'POST   /admin/policy-check       — run policy checks (secret-scan, tier-balance, policy-violations) {checks?:[...],window_hours?:N}',
   'GET    /aios/bootstrap           — SKAP v1: shared-knowledge bootstrap for cross-AI clients ?categories=&since=&limit=&format=json|system-prompt (ETag + 304 supported)',
+  'GET    /admin/db-size            — primary DB size via PRAGMA page_size/page_count + on-disk file stat',
 ];
 
 const server = createServer(async (req, res) => {
@@ -8867,6 +8868,41 @@ const server = createServer(async (req, res) => {
           status: overall,
           findings,
           window_hours: hours,
+          ran_at: new Date().toISOString(),
+        });
+      } catch (e) {
+        sendJson(res, 500, { status: 'fail', error: e.message });
+      }
+    } else if (method === 'GET' && path === '/admin/db-size') {
+      // Stage 4.5 C7b (spec follow-up). Small read-only helper that
+      // reports primary DB size via PRAGMA page_size + page_count
+      // (in-process on ramDb) + file-system stat for the on-disk
+      // size and WAL size. Replaces the PRAGMA spawnSync in
+      // hooks.js:cmdPolicyCheck probe #6.
+      if (req.headers['x-vcontext-admin'] !== 'yes') {
+        return sendJson(res, 403, {
+          error: 'X-Vcontext-Admin: yes header required',
+        });
+      }
+      try {
+        if (!ramDb) {
+          return sendJson(res, 503, { status: 'skipped', reason: 'ramdb_unavailable' });
+        }
+        let pageSize = 0, pageCount = 0;
+        try {
+          pageSize = ramDb.pragma('page_size', { simple: true }) | 0;
+          pageCount = ramDb.pragma('page_count', { simple: true }) | 0;
+        } catch { /* ignore */ }
+        const pagesBytes = pageSize * pageCount;
+        const fsMod = require('node:fs');
+        let onDisk = 0, walBytes = 0, shmBytes = 0;
+        try { onDisk = fsMod.statSync(DB_PATH).size; } catch { /* ignore */ }
+        try { walBytes = fsMod.statSync(DB_PATH + '-wal').size; } catch { /* ignore */ }
+        try { shmBytes = fsMod.statSync(DB_PATH + '-shm').size; } catch { /* ignore */ }
+        sendJson(res, 200, {
+          pages: { page_size: pageSize, page_count: pageCount, bytes: pagesBytes },
+          file: { bytes: onDisk, wal_bytes: walBytes, shm_bytes: shmBytes },
+          path: DB_PATH,
           ran_at: new Date().toISOString(),
         });
       } catch (e) {
