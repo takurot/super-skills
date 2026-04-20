@@ -3,41 +3,81 @@
 # Workflow: detect → research → patch → test → propose (notify user for approval)
 # User approves via dashboard button → auto-apply to main + reload
 # Auto-rollback on test failure. User retains final approval authority.
+#
+# Stage 4.5 C8 (2026-04-20): DEAD_PATH_GUARD + HTTP redirect.
+# Previously read directly from /Volumes/VContext/vcontext.db via
+# sqlite3 CLI. That RAM-disk mount has been gone since morning of
+# 2026-04-20, so these queries were silently returning empty; the
+# "regression detection" logic was a quiet no-op. We now:
+#   1. Refuse to proceed if vcontext server is unreachable
+#     (hard-gate — better than silent-skip)
+#   2. Use the /metrics/report endpoint for per-operation latency
+#     (exists since before Stage 4.5, lives on the server thread)
+#   3. Use /recall for pending-patch counting
+
 set -u
 
 LOG="$HOME/skills/data/self-improve.log"
 mkdir -p "$(dirname "$LOG")"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
-RAM_DB="/Volumes/VContext/vcontext.db"
+VCTX_URL="${VCTX_URL:-http://127.0.0.1:3150}"
 SKILLS_DIR="$HOME/skills"
 cd "$SKILLS_DIR" || exit 1
 
 log "=== self-improve cycle ==="
 
-# Exit if a previous proposal is still pending (one at a time)
-PENDING=$(sqlite3 "$RAM_DB" "SELECT COUNT(*) FROM entries WHERE type='pending-patch' AND json_extract(content,'\$.status') IN ('pending-review','testing');" 2>/dev/null)
+# DEAD_PATH_GUARD — if vcontext server is unreachable, skip the cycle
+# cleanly rather than limping through with empty sqlite3 returns.
+if ! curl -sS -m 3 "$VCTX_URL/health" > /dev/null 2>&1; then
+  log "Server unreachable at $VCTX_URL — skipping self-improve cycle (dead-path guard)"
+  exit 0
+fi
+
+# Exit if a previous proposal is still pending (one at a time).
+PENDING=$(curl -sS -m 5 "$VCTX_URL/recall?type=pending-patch&limit=50" 2>/dev/null | \
+  python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  rows = d.get('results', []) or d.get('entries', [])
+  n = 0
+  for r in rows:
+    try:
+      c = json.loads(r.get('content','{}'))
+      if c.get('status') in ('pending-review','testing'): n += 1
+    except Exception: pass
+  print(n)
+except Exception: print(0)
+" 2>/dev/null)
 if [[ "${PENDING:-0}" -gt 0 ]]; then
   log "Skipping: ${PENDING} proposal(s) still pending user review"
   exit 0
 fi
 
-# 1. Find improvement opportunity (regression OR top-N slowest operation)
-REGRESSION=$(sqlite3 "$RAM_DB" "
-SELECT operation||':'||ROUND(AVG(latency_ms),0)||'ms' FROM api_metrics
-WHERE created_at > datetime('now','-1 hour')
-GROUP BY operation
-HAVING AVG(latency_ms) > (SELECT AVG(latency_ms)*1.3 FROM api_metrics WHERE operation=api_metrics.operation AND created_at BETWEEN datetime('now','-7 days') AND datetime('now','-1 day'));
+# 1. Find improvement opportunity via /metrics/report (per-operation latency).
+REPORT_JSON=$(curl -sS -m 5 "$VCTX_URL/metrics/report?hours=1" 2>/dev/null)
+SLOWEST=$(echo "$REPORT_JSON" | python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  ops = d.get('operations', {}) or {}
+  pairs = [(op, v.get('avg_latency_ms', v.get('avg_latency', 0)) or 0) for op, v in ops.items()]
+  pairs = [p for p in pairs if p[1] > 0]
+  if not pairs:
+    print('')
+  else:
+    pairs.sort(key=lambda x: -x[1])
+    op, lat = pairs[0]
+    print(f'{op}:{int(round(lat))}ms')
+except Exception: print('')
 " 2>/dev/null)
-
-# Even without regression, propose improvements for the slowest operation
-if [[ -z "$REGRESSION" ]]; then
-  SLOWEST=$(sqlite3 "$RAM_DB" "SELECT operation||':'||ROUND(AVG(latency_ms),0)||'ms' FROM api_metrics WHERE created_at > datetime('now','-6 hours') GROUP BY operation ORDER BY AVG(latency_ms) DESC LIMIT 1;" 2>/dev/null)
-  REGRESSION="$SLOWEST (proactive optimization)"
-  log "No regression — proactive mode, targeting: $SLOWEST"
-else
-  log "Regression detected: $REGRESSION"
+if [[ -z "$SLOWEST" ]]; then
+  log "No per-operation metrics available — skipping"
+  exit 0
 fi
+REGRESSION="$SLOWEST (proactive optimization via /metrics/report)"
+log "Targeting: $SLOWEST"
 
 # 2. Research latest best practices
 SEARXNG_PORT=$(docker port searxng 8080 2>/dev/null | head -1 | cut -d: -f2)

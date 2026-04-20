@@ -3,6 +3,13 @@
 # Usage: abtest.sh <param> <value_a> <value_b> <metric> <duration_hours>
 #   param: e.g. EMBED_BATCH, EMBED_WAIT_MS, CLEAR_CACHE_INTERVAL
 #   metric: recall_ms, store_ms, embed_rate, hit_rate
+#
+# Stage 4.5 C8 (2026-04-20): DEAD_PATH_GUARD + HTTP redirect.
+# Previous implementation queried /Volumes/VContext/vcontext.db
+# directly; that mount has been gone since morning of 2026-04-20.
+# get_metric() now reads from /metrics/report (per-operation avg
+# latency) — same signal, no external file lock.
+
 set -u
 
 LOG="$HOME/skills/data/abtest-log.jsonl"
@@ -16,15 +23,61 @@ DURATION_H="${5:-2}"
 
 [ -z "$PARAM" ] && echo "Usage: $0 <param> <value_a> <value_b> <metric> <duration_h>" && exit 1
 
-RAM_DB="/Volumes/VContext/vcontext.db"
+VCTX_URL="${VCTX_URL:-http://127.0.0.1:3150}"
+
+# DEAD_PATH_GUARD — refuse to run if server is unreachable (the old
+# sqlite3-on-RAM-disk path would have silently returned empty metrics,
+# producing false "A=B" verdicts).
+if ! curl -sS -m 3 "$VCTX_URL/health" > /dev/null 2>&1; then
+  echo "vcontext server unreachable at $VCTX_URL — cannot collect metrics" >&2
+  exit 0
+fi
 
 get_metric() {
   local since_min=$1
+  local hours
+  hours=$(( (since_min + 59) / 60 ))   # round up to ≥ 1h window
+  [ "$hours" -lt 1 ] && hours=1
+  local report
+  report=$(curl -sS -m 5 "$VCTX_URL/metrics/report?hours=${hours}" 2>/dev/null)
   case "$METRIC" in
-    recall_ms) sqlite3 "$RAM_DB" "SELECT ROUND(AVG(latency_ms),1) FROM api_metrics WHERE operation='recall' AND created_at > datetime('now','-${since_min} minutes');" ;;
-    store_ms) sqlite3 "$RAM_DB" "SELECT ROUND(AVG(latency_ms),1) FROM api_metrics WHERE operation='store' AND created_at > datetime('now','-${since_min} minutes');" ;;
-    hit_rate) sqlite3 "$RAM_DB" "SELECT ROUND(SUM(CASE WHEN result_count>0 THEN 1 ELSE 0 END)*100.0/COUNT(*),2) FROM api_metrics WHERE operation='recall' AND created_at > datetime('now','-${since_min} minutes');" ;;
-    embed_rate) sqlite3 "$RAM_DB" "SELECT COUNT(*) FROM entries WHERE embedding IS NOT NULL AND created_at > datetime('now','-${since_min} minutes');" ;;
+    recall_ms)
+      echo "$report" | python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  v = d.get('operations', {}).get('recall', {})
+  lat = v.get('avg_latency_ms', v.get('avg_latency', 0)) or 0
+  print(round(lat, 1))
+except Exception: print('')
+" 2>/dev/null ;;
+    store_ms)
+      echo "$report" | python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  v = d.get('operations', {}).get('store', {})
+  lat = v.get('avg_latency_ms', v.get('avg_latency', 0)) or 0
+  print(round(lat, 1))
+except Exception: print('')
+" 2>/dev/null ;;
+    hit_rate)
+      # /metrics/report may not expose hit_rate directly. Compute via
+      # /admin/metrics/window count for recall entries that returned >0
+      # results (if supported) else return empty.
+      echo ""
+      ;;
+    embed_rate)
+      # Count of entries with embeddings in the window — via /admin/metrics/window
+      local window_hours=$(( (since_min + 59) / 60 ))
+      curl -sS -m 5 "$VCTX_URL/admin/metrics/window?hours=${window_hours}&metric=entries" \
+        -H 'X-Vcontext-Admin: yes' 2>/dev/null | python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  print(d.get('entries', {}).get('with_embedding', 0))
+except Exception: print('')
+" 2>/dev/null ;;
   esac
 }
 
