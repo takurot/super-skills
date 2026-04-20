@@ -133,54 +133,80 @@ while [ "${TOTAL_BYTES:-0}" -gt "$CAP_BYTES" ]; do
   TOTAL_BYTES=$(du -sk "$SNAP_DIR" 2>/dev/null | awk '{print $1 * 1024}')
 done
 
-# 9. Auto-tuning — ensure indexes exist, ANALYZE for query planner, periodic VACUUM
-DB_RAM="/Volumes/VContext/vcontext.db"
-DB_SSD="$HOME/skills/data/vcontext-ssd.db"
-for DB in "$DB_RAM" "$DB_SSD"; do
-  [ -f "$DB" ] || continue
-  # Ensure critical indexes (idempotent)
-  sqlite3 "$DB" "
-    CREATE INDEX IF NOT EXISTS idx_entries_embedding_null ON entries(id) WHERE embedding IS NULL;
-    CREATE INDEX IF NOT EXISTS idx_entries_type_created ON entries(type, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_entries_session_id ON entries(session, id DESC);
-  " 2>/dev/null
-  # ANALYZE — update query planner statistics (fast, ~100ms)
-  sqlite3 "$DB" "ANALYZE;" 2>/dev/null
-  log "Auto-tune $(basename $DB): indexes ensured, ANALYZE done"
-done
-# Weekly VACUUM (Sunday only) — reclaim space, defragment
+# 9. Auto-tuning — ensure indexes exist + ANALYZE + (weekly) VACUUM.
+#
+# Stage 4.5 C6: replaces 8 sqlite3 CLI spawns (lines 137-161 pre-C6)
+# with server-internal HTTP endpoints. Two reasons:
+#   1. The old spawns targeted dead paths (/Volumes/VContext/vcontext.db
+#      no longer mounted; /vcontext-ssd.db is stale). The 2026-04-20
+#      audit flagged this class of dead-path booby-trap.
+#   2. Even when paths existed, external sqlite3 CLIs held file-locks
+#      on primary.sqlite — the exact pattern Stage 4.5 removes.
+# Now one curl call per operation, gated by the server's own rate limits.
+VCTX_URL="${VCTX_URL:-http://127.0.0.1:3150}"
+VCTX_ADMIN='X-Vcontext-Admin: yes'
+
+# Auto-tune (idempotent indexes + ANALYZE). Endpoint rate-limits 1/h.
+AUTO_RESP=$(curl -sS -m 30 \
+  -X POST "$VCTX_URL/admin/auto-tune" \
+  -H "$VCTX_ADMIN" -H 'Content-Type: application/json' -d '{}')
+log "Auto-tune (HTTP): $(echo "$AUTO_RESP" | head -c 200)"
+
+# Weekly VACUUM (Sunday only). Server's /admin/vacuum has a size guard
+# that refuses sync VACUUM on a >512 MiB primary (the current 6.7 GB
+# DB would block the event loop for minutes and invite watchdog kills).
+# Override: export VCTX_VACUUM_ALLOW_LARGE=1 on the server process + pass
+# force=true. Until worker-thread VACUUM (C2b) lands, this is a no-op
+# on the live DB — that is deliberate.
 if [ "$(date +%u)" = "7" ] && [ ! -f "/tmp/vcontext-vacuum-$(date +%Y-%V).done" ]; then
-  for DB in "$DB_RAM" "$DB_SSD"; do
-    [ -f "$DB" ] || continue
-    SIZE_BEFORE=$(stat -f%z "$DB" 2>/dev/null)
-    sqlite3 "$DB" "VACUUM;" 2>/dev/null
-    SIZE_AFTER=$(stat -f%z "$DB" 2>/dev/null)
-    log "VACUUM $(basename $DB): ${SIZE_BEFORE}→${SIZE_AFTER} bytes"
-  done
+  VAC_RESP=$(curl -sS -m 15 \
+    -X POST "$VCTX_URL/admin/vacuum" \
+    -H "$VCTX_ADMIN" -H 'Content-Type: application/json' \
+    -d '{"target":"primary","force":true}')
+  log "VACUUM (HTTP, weekly): $(echo "$VAC_RESP" | head -c 200)"
   touch "/tmp/vcontext-vacuum-$(date +%Y-%V).done"
 fi
 
-# 9.5. Performance regression detection
-# Compare last-hour metrics vs 7-day baseline. Alert if >30% slower.
+# 9.5. Performance regression detection — uses /admin/metrics/window
+# (Stage 4.5 C4) so no sqlite3 spawns on primary.
 PERF_LOG="$SKILLS_DIR/data/perf-baseline.jsonl"
 mkdir -p "$(dirname "$PERF_LOG")"
-CURRENT_PERF=$(sqlite3 "$DB_RAM" "SELECT operation, ROUND(AVG(latency_ms),0) FROM api_metrics WHERE created_at > datetime('now','-1 hour') GROUP BY operation;" 2>/dev/null)
-BASELINE_PERF=$(sqlite3 "$DB_RAM" "SELECT operation, ROUND(AVG(latency_ms),0) FROM api_metrics WHERE created_at BETWEEN datetime('now','-7 days') AND datetime('now','-1 day') GROUP BY operation;" 2>/dev/null)
-# Store current snapshot
-echo "$(date +%s)|$CURRENT_PERF" >> "$PERF_LOG"
-# Rotate: keep last 30 days
+CURRENT_JSON=$(curl -sS -m 5 \
+  "$VCTX_URL/admin/metrics/window?hours=1&metric=api_metrics" \
+  -H "$VCTX_ADMIN" 2>/dev/null)
+BASELINE_JSON=$(curl -sS -m 5 \
+  "$VCTX_URL/admin/metrics/window?hours=168&metric=api_metrics" \
+  -H "$VCTX_ADMIN" 2>/dev/null)
+# Extract p95 latencies for quick regression signal. jq not guaranteed
+# installed, so use python3 (ships with macOS).
+CUR_P95=$(echo "$CURRENT_JSON" | python3 -c "
+import sys, json
+try:
+  d = json.loads(sys.stdin.read())
+  print(d.get('api_metrics', {}).get('latency_p95_ms', 0))
+except Exception:
+  print(0)
+" 2>/dev/null)
+BASE_P95=$(echo "$BASELINE_JSON" | python3 -c "
+import sys, json
+try:
+  d = json.loads(sys.stdin.read())
+  print(d.get('api_metrics', {}).get('latency_p95_ms', 0))
+except Exception:
+  print(0)
+" 2>/dev/null)
+echo "$(date +%s)|p95_cur=${CUR_P95}|p95_base=${BASE_P95}" >> "$PERF_LOG"
+# Rotate: keep last 720 rows (30 days @ 1/h).
 tail -720 "$PERF_LOG" > "$PERF_LOG.tmp" && mv "$PERF_LOG.tmp" "$PERF_LOG" 2>/dev/null
-# Compare
-while IFS='|' read -r op cur; do
-  base=$(echo "$BASELINE_PERF" | grep "^${op}|" | cut -d'|' -f2)
-  if [[ -n "$base" ]] && [[ "$base" -gt 10 ]] && [[ -n "$cur" ]]; then
-    ratio=$((cur * 100 / base))
-    if [[ "$ratio" -gt 130 ]]; then
-      log "PERF REGRESSION: $op current=${cur}ms baseline=${base}ms (+${ratio}%)"
-      osascript -e "display notification \"${op} latency ${cur}ms vs baseline ${base}ms\" with title \"⚠️ vcontext perf regression\"" 2>/dev/null
-    fi
+# Alert if current p95 is >30% worse than baseline p95 (both > 10ms).
+if [[ -n "$CUR_P95" ]] && [[ -n "$BASE_P95" ]] \
+   && [[ "$CUR_P95" -gt 10 ]] && [[ "$BASE_P95" -gt 10 ]]; then
+  ratio=$((CUR_P95 * 100 / BASE_P95))
+  if [[ "$ratio" -gt 130 ]]; then
+    log "PERF REGRESSION p95: current=${CUR_P95}ms baseline=${BASE_P95}ms (+${ratio}%)"
+    osascript -e "display notification \"p95 latency ${CUR_P95}ms vs baseline ${BASE_P95}ms\" with title \"⚠️ vcontext perf regression\"" 2>/dev/null
   fi
-done <<< "$CURRENT_PERF"
+fi
 
 # 10. Upstream sync (was self-evolve) — check git remote for updates
 SKILLS_DIR="$HOME/skills"
@@ -198,12 +224,28 @@ fi
 # 11. Evolution log — append daily summary to docs/evolution-log.md
 EVOLUTION_LOG="$SKILLS_DIR/docs/evolution-log.md"
 if [ -d "$SKILLS_DIR/docs" ]; then
-  DISCOVERY_COUNT=$(sqlite3 "$DB_RAM" "SELECT COUNT(*) FROM entries WHERE type='skill-discovery' AND created_at >= datetime('now','-24 hours');" 2>/dev/null)
-  SUGGESTION_COUNT=$(sqlite3 "$DB_RAM" "SELECT COUNT(*) FROM entries WHERE type='skill-suggestion' AND created_at >= datetime('now','-24 hours');" 2>/dev/null)
-  CREATED_COUNT=$(sqlite3 "$DB_RAM" "SELECT COUNT(*) FROM entries WHERE type='skill-created' AND created_at >= datetime('now','-24 hours');" 2>/dev/null)
-  EMBED_TOTAL=$(sqlite3 "$DB_RAM" "SELECT COUNT(*) FROM entries;" 2>/dev/null)
-  EMBED_DONE=$(sqlite3 "$DB_RAM" "SELECT COUNT(*) FROM entries WHERE embedding IS NOT NULL;" 2>/dev/null)
-  SESSIONS=$(sqlite3 "$DB_RAM" "SELECT COUNT(DISTINCT session) FROM entries WHERE created_at >= datetime('now','-24 hours');" 2>/dev/null)
+  # Stage 4.5 C6: stats via /admin/metrics/window (single HTTP call
+  # replaces 6 sqlite3 spawns on primary).
+  STATS_JSON=$(curl -sS -m 8 \
+    "$VCTX_URL/admin/metrics/window?hours=24&metric=entries" \
+    -H "$VCTX_ADMIN" 2>/dev/null)
+  EVAL_STATS=$(echo "$STATS_JSON" | python3 -c "
+import sys, json
+try:
+  d = json.loads(sys.stdin.read())
+  en = d.get('entries', {})
+  by = en.get('by_type', {})
+  discovery = by.get('skill-discovery', 0)
+  suggestion = by.get('skill-suggestion', 0)
+  created   = by.get('skill-created', 0)
+  embed_total = en.get('total', 0)
+  embed_done  = en.get('with_embedding', 0)
+  sessions    = en.get('distinct_sessions', 0)
+  print(f'{discovery}|{suggestion}|{created}|{embed_total}|{embed_done}|{sessions}')
+except Exception:
+  print('0|0|0|0|0|0')
+" 2>/dev/null)
+  IFS='|' read -r DISCOVERY_COUNT SUGGESTION_COUNT CREATED_COUNT EMBED_TOTAL EMBED_DONE SESSIONS <<< "$EVAL_STATS"
   cat >> "$EVOLUTION_LOG" <<EOFLOG
 
 ## $(date +%Y-%m-%d) — auto (maintenance)
