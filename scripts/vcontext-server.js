@@ -4775,6 +4775,15 @@ function syncRamToSsd() {
   const ramMaxId = ramMax[0]?.max_id || 0;
   const gap = ramMaxId - ssdMaxId;
   if (gap <= 0) return;
+  // C11 D8 (2026-04-20): pre-emptive DETACH before ATTACH. When a
+  // previous ATTACH-INSERT-DETACH batch had the INSERT fail (e.g.
+  // due to mmap-reclaim "file is not a database"), the DETACH at the
+  // end of that batch never ran, leaving the 'ssd' alias leaked on
+  // the connection. Next iteration's ATTACH then errors with
+  // "database ssd is already in use" (observed: 43 × per 30-min log
+  // window). The pre-emptive DETACH is a no-op when no leak exists
+  // (errors silently caught), and cleans up when one is present.
+  try { ramDb.exec(`DETACH ssd;`); } catch { /* not attached — ok */ }
   // Use ATTACH to copy missing entries in one shot (including embedding)
   dbExec(`
     ATTACH '${SSD_DB_PATH}' AS ssd;
@@ -4793,6 +4802,8 @@ function syncRamToSsd() {
 // legacy behavior when no caller specifies.
 function syncEmbeddingsToSsd(batchSize = 200) {
   if (!existsSync(SSD_DB_PATH)) return;
+  // C11 D8: pre-emptive DETACH — see sync RAM→SSD comment above.
+  try { ramDb.exec(`DETACH ssd;`); } catch { /* not attached — ok */ }
   try {
     dbExec(`
       ATTACH '${SSD_DB_PATH}' AS ssd;
@@ -4830,6 +4841,8 @@ function restoreRamFromSsd() {
 
   console.log(`[vcontext:restore] RAM has ${ramC} entries, SSD has ${ssdC} (${gap} missing). Restoring...`);
 
+  // C11 D8: pre-emptive DETACH — see sync RAM→SSD comment at line ~4778.
+  try { ramDb.exec(`DETACH ssd;`); } catch { /* not attached — ok */ }
   try {
     dbExec(`
       ATTACH '${SSD_DB_PATH}' AS ssd;
