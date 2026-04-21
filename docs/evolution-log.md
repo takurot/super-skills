@@ -907,3 +907,35 @@ TDD RED→GREEN on every endpoint kept the 49-commit day free of
 regression noise. Three HITL cycles (C9 H3 pending, SKAP Phase E
 deferred, Qwen3.6-35B decision deferred) show the co-evolution
 pattern from Constitution Axiom 4 working as designed.
+
+## 2026-04-20 — evolution-cycle 2026-16
+
+**Type**: evolution-cycle (weekly scheduled)
+**Weights used**: w1=0.25, w2=0.25, w3=0.2, w4=0.2, w5=0.1
+**Candidates gathered**: total=5, by source={"self_improve":5}
+**Top-K scored**: 3
+**Pending-patches emitted**: 0
+**Observation mode**: yes
+**Notes**: observation mode: Phase (c)-(e) skipped
+
+## 2026-04-21 — Session 905f38bd (evening emergency recovery + AIOS clarification)
+
+**Type**: emergency-recovery + stability-migration
+
+**Shipped**:
+- H10+H12 root cause definitively identified (wrapper.sh:99-100 `wait_server_bound` 120s timeout, triggered by 9 GB DB slow startup + hourly backup contention)
+- `scripts/migrations/embedding-json-to-blob.mjs` + reverse — 103,485 rows migrated, 1,783 skipped (768-dim legacy, separately NULL-swept for re-embed)
+- Commit 21210f8 — POST /store 1 MiB content size guard (fts5 corruption defense)
+- Commit 5321311 — BLOB migration + decodeEmbedding helper (7 call sites updated)
+- VACUUM: primary 8.54 → 3.55 GB, ssd 8.60 → 3.55 GB
+- Disk recovery: +40 GiB (corrupt orphans + old snapshots + premigration + stale backups)
+- com.vcontext.backup restored; first post-fix cycle: 3.55 GB in 30.5s, integrity ok, zero crash
+
+**Key decisions**:
+- L2 loop memory gate: SKIP (Agent 3 re-run verdict; backup was the real trigger)
+- Devin-style integration path: A (AIOS 内製 via claude-api + task-runner + SKAP)
+- AIOS principle clarified: local is a phase, not a rule (memory recorded)
+
+**Crash count**: 6 SIGKILL-137 (all pre-cleanup or during VACUUM transition); steady state post-cleanup = 0
+
+**Next session**: see `docs/handoff/2026-04-22-next-session-kickoff.md`
