@@ -9796,14 +9796,20 @@ function shutdown(signal) {
     try { client.socket.destroy(); } catch {}
   }
   wsClients.clear();
-  // Synchronous backup on shutdown (doBackup is async now, so use copyFileSync directly)
-  try {
-    mkdirSync(BACKUP_DIR, { recursive: true });
-    if (existsSync(DB_PATH)) {
-      copyFileSync(DB_PATH, BACKUP_PATH);
-      console.log('[vcontext] Shutdown backup (file copy) complete');
-    }
-  } catch (e) { console.error('[vcontext] Shutdown backup failed:', e.message); }
+  // 2026-04-21 FIX — removed the shutdown copyFileSync(DB_PATH, BACKUP_PATH).
+  // primary.sqlite is ~6.9 GB; copyFileSync took ~7s to complete.
+  // launchd's exit_timeout is 5s → copyFileSync always exceeded it →
+  // launchd escalated SIGTERM → SIGKILL (exit code 137) mid-copy.
+  // That explained the persistent 3-4/h SIGKILL-137 crashes + the
+  // recurring "7153.1 MB backup-tmp orphan" at next startup.
+  //
+  // The copyFileSync is redundant:
+  //   - vcontext-ssd.db is already the persistent store (tier migration)
+  //   - com.vcontext.backup LaunchAgent does periodic .backup() properly
+  //   - Losing in-flight RAM-only entries is acceptable on shutdown
+  //     (they get backfilled from SSD on next startup via restoreRamFromSsd)
+  //
+  // Shutdown now does ONLY what must happen: close sockets + close DB handles.
   embedLoopRunning = false;
   discoveryLoopRunning = false;
   if (vecDb) { try { vecDb.close(); } catch {} }
@@ -9813,8 +9819,8 @@ function shutdown(signal) {
     console.log('[vcontext] Server closed');
     process.exit(0);
   });
-  // Force exit after 5s
-  setTimeout(() => process.exit(0), 5000);
+  // Force exit after 2s (well under launchd's 5s timeout)
+  setTimeout(() => process.exit(0), 2000);
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
