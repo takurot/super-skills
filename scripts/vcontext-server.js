@@ -3721,7 +3721,25 @@ async function startEmbedLoop() {
 const yieldToEventLoop = () =>
   new Promise((resolve) => setImmediate(resolve));
 
+// RTOS-style cycle metrics. Tracks wall-clock duration of each
+// doBackupAndMigrate tick and the inter-tick interval. A tick that consumes
+// > 50 % of BACKUP_INTERVAL_MS is "slow"; consecutive slow ticks point at
+// an event-loop saturation trend (what previously preceded SIGKILL-137 via
+// wrapper wait_server_bound timeout). detectAnomalies reads these.
+const _cycleMetrics = {
+  lastStartedAt: 0,      // Date.now() at the start of the last tick
+  lastDurationMs: 0,     // wall-clock duration of the last tick
+  lastJitterMs: 0,       // abs(interval - BACKUP_INTERVAL_MS) of the last tick
+  consecutiveSlowCycles: 0,
+};
+
 async function doBackupAndMigrate() {
+  // RTOS-style: record tick start + inter-tick interval for deadline-miss detection
+  const _cycleStart = Date.now();
+  const _prevStart = _cycleMetrics.lastStartedAt;
+  _cycleMetrics.lastStartedAt = _cycleStart;
+  _cycleMetrics.lastJitterMs = _prevStart ? Math.abs((_cycleStart - _prevStart) - BACKUP_INTERVAL_MS) : 0;
+
   // doBackup() intentionally NOT called here anymore — see header comment.
   //
   // 2026-04-20 WAL management: wal_autocheckpoint=500 runs PASSIVE
@@ -3875,6 +3893,18 @@ async function doBackupAndMigrate() {
   }
   // Anomaly detection — 4 small queries, don't need mid-yield
   try { detectAnomalies(); } catch {}
+
+  // RTOS-style: record tick duration for the deadline-miss check. "Slow"
+  // = tick consumed > 50 % of BACKUP_INTERVAL_MS; 3 consecutive slow ticks
+  // are a real regression signal (this was the failure mode that lead to
+  // wrapper's wait_server_bound timeout SIGKILL in today's crash chain).
+  _cycleMetrics.lastDurationMs = Date.now() - _cycleStart;
+  if (_cycleMetrics.lastDurationMs > BACKUP_INTERVAL_MS * 0.5) {
+    _cycleMetrics.consecutiveSlowCycles++;
+    console.log(`[cycle-metrics] slow tick: ${_cycleMetrics.lastDurationMs}ms (budget ${Math.round(BACKUP_INTERVAL_MS * 0.5)}ms), streak=${_cycleMetrics.consecutiveSlowCycles}`);
+  } else {
+    _cycleMetrics.consecutiveSlowCycles = 0;
+  }
 }
 
 // ── Anomaly detection ─────────────────────────────────────────
@@ -4030,6 +4060,28 @@ function detectAnomalies() {
       }
     }
   } catch {}
+
+  // 9. Cycle duration / deadline miss (RTOS-style observability).
+  // doBackupAndMigrate runs every BACKUP_INTERVAL_MS (5min); if a tick
+  // consistently eats > 50 % of that budget, the scheduler is saturated
+  // and /health latency degrades — the same path that led to wrapper
+  // wait_server_bound SIGKILL before today's DB shrink. 3 consecutive
+  // slow ticks = real trend, not a one-off spike.
+  if (_cycleMetrics.consecutiveSlowCycles >= 3) {
+    const budgetPct = Math.round((_cycleMetrics.lastDurationMs / BACKUP_INTERVAL_MS) * 100);
+    alerts.push({
+      level: 'medium',
+      msg: `doBackupAndMigrate slow ${_cycleMetrics.consecutiveSlowCycles}× consecutive — last=${_cycleMetrics.lastDurationMs}ms (${budgetPct}% of ${BACKUP_INTERVAL_MS/1000}s interval)`,
+    });
+  }
+  // Excessive jitter: interval between ticks wanders > 20 % from expected.
+  // Usually means the event loop is blocked and setInterval is firing late.
+  if (_cycleMetrics.lastJitterMs > BACKUP_INTERVAL_MS * 0.2) {
+    alerts.push({
+      level: 'medium',
+      msg: `Tick interval jitter ${_cycleMetrics.lastJitterMs}ms (>20% of expected ${BACKUP_INTERVAL_MS}ms)`,
+    });
+  }
 
   // Store alerts
   if (alerts.length > 0) {
