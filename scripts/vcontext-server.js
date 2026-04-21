@@ -1609,9 +1609,10 @@ async function handleStore(req, res) {
           console.log(`[store] MLX embed failed: ${e.message}`);
         }
         if (embedding && embedding.length > 0) {
-          const embJson = esc(JSON.stringify(embedding));
-          dbExec(`UPDATE entries SET embedding = ${embJson} WHERE id = ${entry.id};`);
-          try { dbExec(`UPDATE entries SET embedding = ${embJson} WHERE id = ${entry.id};`, SSD_DB_PATH); } catch {}
+          // During JSON→BLOB migration: write BLOB form via prepared
+          // statement (new canonical format). The helper writes to both
+          // RAM and SSD. vecUpsert still handles the vec_entries index.
+          writeEmbeddingBlob(entry.id, embedding);
           vecUpsert(entry.id, embedding);
           try { dbExec(`UPDATE entry_index SET has_embedding = 1 WHERE entry_id = ${entry.id};`); } catch {}
         }
@@ -2014,7 +2015,21 @@ function handleRecent(req, res) {
       out.content = out.content.slice(0, 500) + '…';
       out._truncated = true;
     }
-    if (short) delete out.embedding;
+    if (short) {
+      delete out.embedding;
+    } else if (out.embedding != null) {
+      // JSON→BLOB migration: clients historically received a JSON array
+      // (or JSON string that they'd JSON.parse). With the BLOB column
+      // better-sqlite3 hands us a Node Buffer, which JSON.stringify
+      // serializes as {"type":"Buffer","data":[…]} — a breaking shape
+      // change for any caller that doesn't special-case Buffers. Decode
+      // to a plain array so the wire shape stays stable across the
+      // migration window. (String embeddings are left as-is.)
+      if (Buffer.isBuffer(out.embedding)) {
+        const decoded = decodeEmbedding(out.embedding);
+        if (decoded) out.embedding = decoded;
+      }
+    }
     return out;
   });
 
@@ -3637,9 +3652,9 @@ async function startEmbedLoop() {
         for (let i = 0; i < rows.length; i++) {
           const emb = embeddings[i];
           if (!emb || emb.length === 0) continue;
-          const embJson = esc(JSON.stringify(emb));
-          try { dbExec(`UPDATE entries SET embedding = ${embJson} WHERE id = ${rows[i].id};`); } catch {}
-          try { dbExec(`UPDATE entries SET embedding = ${embJson} WHERE id = ${rows[i].id};`, SSD_DB_PATH); } catch {}
+          // BLOB write path (new canonical format) — writes to both
+          // RAM and SSD under the hood.
+          try { writeEmbeddingBlob(rows[i].id, emb); } catch {}
           try { vecUpsert(rows[i].id, emb); } catch {}
           try { dbExec(`UPDATE entry_index SET has_embedding = 1 WHERE entry_id = ${rows[i].id};`); } catch {}
         }
@@ -5086,12 +5101,42 @@ function wsBroadcast(eventType, entry) {
 let vecDb = null; // better-sqlite3 instance with vec0 extension
 let EMBED_DIM = 4096; // Qwen3-Embedding-8B (auto-detected from first embedding if available)
 
+/**
+ * Decode an `entries.embedding` value into a plain JS Array of floats,
+ * handling BOTH storage formats during migration window:
+ *   - Buffer (new BLOB format, 16384 bytes for 4096 f32)
+ *   - string (legacy JSON-text format)
+ * Returns null if decoding fails or value is unusable.
+ * Callers that want a Float32Array should build one from the returned
+ * array; cosineSimilarity() accepts plain arrays today.
+ */
+function decodeEmbedding(val) {
+  if (val == null) return null;
+  if (Buffer.isBuffer(val)) {
+    // Aligned view into the Buffer's underlying ArrayBuffer. byteLength
+    // must be a multiple of 4; we guard that before interpreting.
+    if (val.byteLength % 4 !== 0) return null;
+    const f32 = new Float32Array(val.buffer, val.byteOffset, val.byteLength / 4);
+    return Array.from(f32);
+  }
+  if (typeof val === 'string') {
+    try { return JSON.parse(val); } catch { return null; }
+  }
+  return null;
+}
+
 function initVecDb() {
   try {
-    // Auto-detect embedding dimension (skip if DB under pressure)
+    // Auto-detect embedding dimension (skip if DB under pressure).
+    // During the JSON→BLOB migration window, the first non-NULL row may
+    // be either a Buffer (post-migration) or a JSON string (pre). Use
+    // decodeEmbedding() to handle both formats transparently.
     try {
       const dimRows = dbQuery("SELECT embedding FROM entries WHERE embedding IS NOT NULL ORDER BY id DESC LIMIT 1;");
-      if (dimRows[0]) { try { EMBED_DIM = JSON.parse(dimRows[0].embedding).length; } catch {} }
+      if (dimRows[0]) {
+        const decoded = decodeEmbedding(dimRows[0].embedding);
+        if (decoded && decoded.length > 0) EMBED_DIM = decoded.length;
+      }
     } catch {}
 
     const Database = require('better-sqlite3');
@@ -5111,6 +5156,38 @@ function vecUpsert(id, embedding) {
   try {
     const embJson = JSON.stringify(embedding).replace(/'/g, "''");
     vecDb.exec(`INSERT OR REPLACE INTO vec_entries(rowid, embedding) VALUES (${Number(id)}, vec_f32('${embJson}'))`);
+  } catch {}
+}
+
+/**
+ * Persist a freshly-computed embedding into entries.embedding as a
+ * binary Float32 BLOB via a prepared statement (BLOBs cannot be
+ * interpolated into SQL string literals). Writes to both RAM and SSD
+ * DBs when present, mirroring the JSON-text write path. Does NOT
+ * touch vec_entries — that's vecUpsert's job.
+ *
+ * During the JSON→BLOB migration window this coexists with the legacy
+ * JSON-text UPDATE: callers do the legacy write first, then this
+ * function overwrites with a BLOB. Once migration is complete and the
+ * JSON path is removed, this becomes the sole writer.
+ */
+function writeEmbeddingBlob(id, embedding) {
+  if (!embedding || embedding.length !== EMBED_DIM) return;
+  try {
+    const f32 = embedding instanceof Float32Array ? embedding : new Float32Array(embedding);
+    const buf = Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength);
+    try {
+      ramDb.prepare(`UPDATE entries SET embedding = ? WHERE id = ?;`).run(buf, Number(id));
+    } catch (e) {
+      console.error(`[embed-blob] RAM update failed id=${id}: ${e.message?.slice(0, 80)}`);
+    }
+    if (ssdDb) {
+      try {
+        ssdDb.prepare(`UPDATE entries SET embedding = ? WHERE id = ?;`).run(buf, Number(id));
+      } catch (e) {
+        console.error(`[embed-blob] SSD update failed id=${id}: ${e.message?.slice(0, 80)}`);
+      }
+    }
   } catch {}
 }
 
@@ -5164,9 +5241,13 @@ function vecSync() {
     let synced = 0;
     for (const row of rows) {
       try {
-        const emb = JSON.parse(row.embedding);
-        if (emb.length === EMBED_DIM) {
-          const embStr = row.embedding.replace(/'/g, "''");
+        // JSON→BLOB migration: decodeEmbedding normalizes both shapes
+        // to a plain array. vec_f32() accepts a JSON-encoded array, so
+        // we always round-trip through JSON.stringify for the vecDb
+        // write — BLOB rows are re-encoded here, TEXT rows remain JSON.
+        const emb = decodeEmbedding(row.embedding);
+        if (emb && emb.length === EMBED_DIM) {
+          const embStr = JSON.stringify(emb).replace(/'/g, "''");
           vecDb.exec(`INSERT OR IGNORE INTO vec_entries(rowid, embedding) VALUES (${Number(row.id)}, vec_f32('${embStr}'))`);
           synced++;
         }
@@ -5806,7 +5887,10 @@ async function handleSemanticSearch(req, res) {
     const rows = dbQuery(`SELECT id, type, content, tags, created_at, reasoning, embedding FROM entries WHERE type=${esc(typeFilter)} AND embedding IS NOT NULL;`);
     for (const row of rows) {
       try {
-        const entryEmbed = JSON.parse(row.embedding);
+        // JSON→BLOB migration: decodeEmbedding handles both Buffer (new)
+        // and JSON-string (legacy) rows transparently.
+        const entryEmbed = decodeEmbedding(row.embedding);
+        if (!entryEmbed) continue;
         const sim = cosineSimilarity(queryEmbed, entryEmbed);
         if (sim >= threshold || threshold <= 0.1) {
           results.push({
@@ -5855,7 +5939,9 @@ async function handleSemanticSearch(req, res) {
     const rows = dbQuery(`SELECT id, type, content, tags, created_at, embedding, reasoning FROM entries WHERE embedding IS NOT NULL${typeClause};`);
     for (const row of rows) {
       try {
-        const entryEmbed = JSON.parse(row.embedding);
+        // JSON→BLOB migration: decodeEmbedding handles both formats.
+        const entryEmbed = decodeEmbedding(row.embedding);
+        if (!entryEmbed) continue;
         const sim = cosineSimilarity(queryEmbed, entryEmbed);
         if (sim >= threshold) {
           results.push({
