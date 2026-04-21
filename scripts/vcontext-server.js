@@ -9789,38 +9789,54 @@ const rawSyncTimer = setInterval(() => {
 // Graceful shutdown
 function shutdown(signal) {
   console.log(`\n[vcontext] Received ${signal}, shutting down...`);
+
+  // 2026-04-21 H12 FIX — register force-exit FIRST, before any cleanup.
+  //
+  // The H10 fix (removing copyFileSync) was partial. The remaining
+  // SIGKILL-137 source is the synchronous ramDb.close() call:
+  // if /admin/backup is mid-execution (ramDb.backup() holding page
+  // locks), ramDb.close() blocks in native C code. Once blocked,
+  // the JS event loop cannot run, so setTimeout(() => exit, 2000)
+  // never fires. After launchd's 5s exit_timeout, SIGKILL arrives —
+  // and the ~7 GB .tmp file is orphaned (recurring 7153.1 MB sweep
+  // at next startup, 45+ occurrences observed).
+  //
+  // Fix: exit forcibly at 500 ms regardless of close() progress.
+  // SQLite WAL mode is crash-safe — skipping close() is acceptable:
+  //   - WAL journals ensure next startup recovers any committed rows
+  //   - OS releases file handles on process exit
+  //   - In-flight /admin/backup loses its current cycle (retried next
+  //     hour per backup LaunchAgent interval)
+  //   - No data corruption risk (SQLite's recovery invariant)
+  //
+  // Also reduce graceful-close attempts: skip ramDb.close() entirely.
+  // vecDb and ssdDb are low-contention → best-effort close.
+  setTimeout(() => {
+    console.log('[vcontext] Force exit (500ms safety timer)');
+    process.exit(0);
+  }, 500);
+
   clearInterval(backupTimer);
   clearInterval(rawSyncTimer);
-  // Close all WebSocket connections
+  // Close all WebSocket connections — cheap, non-blocking.
   for (const [id, client] of wsClients) {
     try { client.socket.destroy(); } catch {}
   }
   wsClients.clear();
-  // 2026-04-21 FIX — removed the shutdown copyFileSync(DB_PATH, BACKUP_PATH).
-  // primary.sqlite is ~6.9 GB; copyFileSync took ~7s to complete.
-  // launchd's exit_timeout is 5s → copyFileSync always exceeded it →
-  // launchd escalated SIGTERM → SIGKILL (exit code 137) mid-copy.
-  // That explained the persistent 3-4/h SIGKILL-137 crashes + the
-  // recurring "7153.1 MB backup-tmp orphan" at next startup.
-  //
-  // The copyFileSync is redundant:
-  //   - vcontext-ssd.db is already the persistent store (tier migration)
-  //   - com.vcontext.backup LaunchAgent does periodic .backup() properly
-  //   - Losing in-flight RAM-only entries is acceptable on shutdown
-  //     (they get backfilled from SSD on next startup via restoreRamFromSsd)
-  //
-  // Shutdown now does ONLY what must happen: close sockets + close DB handles.
   embedLoopRunning = false;
   discoveryLoopRunning = false;
+  // Best-effort close on low-contention DBs. DO NOT call ramDb.close()
+  // — it may block for many seconds if /admin/backup is holding the
+  // connection (H12 root cause).
   if (vecDb) { try { vecDb.close(); } catch {} }
-  if (ramDb) { try { ramDb.close(); } catch {} }
   if (ssdDb) { try { ssdDb.close(); } catch {} }
-  server.close(() => {
-    console.log('[vcontext] Server closed');
-    process.exit(0);
-  });
-  // Force exit after 2s (well under launchd's 5s timeout)
-  setTimeout(() => process.exit(0), 2000);
+  try {
+    server.close(() => {
+      console.log('[vcontext] Server closed gracefully');
+      process.exit(0);
+    });
+  } catch {}
+  // If we reach here, the setTimeout above will force-exit at 500ms.
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
