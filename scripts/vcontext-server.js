@@ -3978,6 +3978,54 @@ function detectAnomalies() {
     }
   } catch {}
 
+  // 8. LaunchAgent service health — detect com.vcontext.* services exited non-zero.
+  // Today (2026-04-21) task-runner / article-scanner-evening / maintenance ended
+  // with exit != 0 and no anomaly fired — user had to spot it via `launchctl list`.
+  // Fire-and-forget async probe: the main detectAnomalies() stays synchronous so
+  // the scheduler loop never stalls on launchctl. On resolve we insert an
+  // anomaly-alert row directly (same schema as the batched path above).
+  // Reuses _anomalyLastAction throttling with key 'launchd-unhealthy' so repeat
+  // failures don't spam the DB every 5-min cycle.
+  try {
+    if (process.platform === 'darwin') {
+      const kind = 'launchd-unhealthy';
+      const last = _anomalyLastAction.get(kind) || 0;
+      if (Date.now() - last >= ANOMALY_COOLDOWN_MS) {
+        const { execFile } = require('node:child_process');
+        new Promise((resolve, reject) => {
+          const child = execFile('launchctl', ['list'], { timeout: 3000, maxBuffer: 2 * 1024 * 1024 }, (err, stdout) => {
+            if (err) reject(err); else resolve(stdout || '');
+          });
+          child.on('error', reject);
+        }).then((stdout) => {
+          // launchctl list → tab-separated `PID<TAB>LastExit<TAB>Label` (header line first).
+          const dead = [];
+          for (const line of stdout.split('\n')) {
+            const parts = line.split('\t');
+            if (parts.length < 3) continue;
+            const label = parts[2].trim();
+            if (!label.startsWith('com.vcontext.')) continue;
+            if (label === 'com.vcontext.server') continue; // skip self — if dead, we wouldn't be here
+            const lastExit = parseInt(parts[1], 10);
+            if (Number.isFinite(lastExit) && lastExit !== 0) {
+              dead.push({ label: label.replace(/^com\.vcontext\./, ''), exit: lastExit });
+            }
+          }
+          if (dead.length === 0) return;
+          _anomalyLastAction.set(kind, Date.now());
+          const shown = dead.slice(0, 5).map(d => `${d.label} exit=${d.exit}`).join(', ');
+          const suffix = dead.length > 5 ? `, ... (${dead.length} total)` : '';
+          const msg = `LaunchAgent failures: ${shown}${suffix}`;
+          const content = JSON.stringify({ alerts: [{ level: 'medium', msg }], detected_at: new Date().toISOString() });
+          try {
+            dbExec(`INSERT INTO entries (type, content, tags, session, token_estimate, last_accessed, access_count, tier) VALUES ('anomaly-alert', ${esc(content)}, '["anomaly-alert","auto","launchd"]', 'system', ${estimateTokens(content)}, datetime('now'), 0, 'ram');`);
+            console.log(`[vcontext:alert] launchd ${dead.length} service(s) unhealthy: ${shown}${suffix}`);
+          } catch {}
+        }).catch(() => { /* launchctl missing / timeout / parse error — silent skip */ });
+      }
+    }
+  } catch {}
+
   // Store alerts
   if (alerts.length > 0) {
     const content = JSON.stringify({ alerts, detected_at: new Date().toISOString() });
