@@ -3899,12 +3899,17 @@ function detectAnomalies() {
   // long-term store; migrated entries leave RAM). Only a POSITIVE gap
   // (RAM > SSD, i.e. SSD is missing data that's in RAM) is a real
   // anomaly — it would mean the server's tier migration has failed.
-  // Negative gap is normal and grows linearly with cold storage.
-  const ramCount = dbQuery("SELECT COUNT(*) as c FROM entries;");
-  const ssdCount = dbQuery("SELECT COUNT(*) as c FROM entries;", SSD_DB_PATH);
+  // 2026-04-21: Exclude types that are BY DESIGN kept in RAM and never
+  // migrate (working-state/anomaly-alert/pre-tool/session-recall/test/
+  // anomaly-response). Without this filter, the naive COUNT(*) diff grows
+  // monotonically as those ephemeral types accumulate in RAM, firing a
+  // false-positive anomaly every 5-min cycle.
+  const SYNC_SKIP_TYPES = "'working-state','anomaly-alert','pre-tool','session-recall','test','anomaly-response'";
+  const ramCount = dbQuery(`SELECT COUNT(*) as c FROM entries WHERE type NOT IN (${SYNC_SKIP_TYPES});`);
+  const ssdCount = dbQuery(`SELECT COUNT(*) as c FROM entries WHERE type NOT IN (${SYNC_SKIP_TYPES});`, SSD_DB_PATH);
   const gap = (ramCount[0]?.c || 0) - (ssdCount[0]?.c || 0);
   if (gap > 100) {
-    alerts.push({ level: 'medium', msg: `RAM ahead of SSD by ${gap} entries — tier migration may be failing` });
+    alerts.push({ level: 'medium', msg: `RAM ahead of SSD by ${gap} migratable entries — tier migration may be failing` });
   }
 
   // 4. Disk usage >3GB — ONLY meaningful in RAM-disk mode (18GB budget tight).
