@@ -4179,6 +4179,26 @@ function detectAnomalies() {
     });
   }
 
+  // 10. MLX embed latency regression (C11 D7 follow-up).
+  // The "8 timeouts / 30 min" signal already raises an alert, but can't
+  // distinguish "steady-state slow" from "tail-latency spike". Ring-buffer
+  // p95 vs 24h-ago baseline surfaces the slope before it becomes timeouts.
+  // n >= 20 guards against tiny-sample noise (at healthy ~78/min throughput,
+  // this represents <20s of data).
+  try {
+    const stats = _mlxLatencyStats('single');
+    if (stats.n >= 20 && stats.p95 !== null) {
+      const base = dbQuery(`SELECT AVG(latency_ms) as avg FROM api_metrics WHERE operation='embed' AND created_at BETWEEN datetime('now','-24 hours') AND datetime('now','-1 hour');`);
+      const baseAvg = base[0]?.avg || 0;
+      if (baseAvg > 0 && stats.p95 > baseAvg * 5) {
+        alerts.push({
+          level: 'medium',
+          msg: `MLX embed p95 regression: ${stats.p95}ms (baseline ~${Math.round(baseAvg)}ms, ${Math.round(stats.p95/baseAvg)}× slower)`,
+        });
+      }
+    }
+  } catch {}
+
   // Store alerts
   if (alerts.length > 0) {
     const content = JSON.stringify({ alerts, detected_at: new Date().toISOString() });
@@ -5570,6 +5590,56 @@ function withMlxLock(fn) {
   return prev.then(() => fn().finally(release));
 }
 
+// ── MLX keep-alive probe (2026-04-21) ──────────────────────────
+// Periodic tiny-embed to keep the MLX model warm and detect crashes
+// before a user request fails. Self-scheduling setTimeout chain so the
+// interval can adapt (30s healthy, 2min while unavailable).
+//
+// Interaction with circuit breaker: when _isEmbedCircuitOpen() is true,
+// the embed loop has already decided MLX needs a break — the probe SKIPS
+// this tick to avoid adding pressure during the open-circuit window.
+//
+// Interaction with mlxAvailable: probe updates the flag on 2 consecutive
+// fails (mark unavailable) or on success after fail (restore). Downstream
+// code (/store, semantic search, embed loop) already gates on mlxAvailable.
+let _mlxKeepAliveStreak = 0;
+let _mlxKeepAliveTimer = null;
+const MLX_KEEPALIVE_INTERVAL_MS = 30000;      // 30s when healthy
+const MLX_KEEPALIVE_RECOVERY_MS = 120000;     // 2min when unavailable (less pressure)
+const MLX_KEEPALIVE_FAIL_THRESHOLD = 2;       // 2 consecutive fails → mark unavailable
+
+async function _mlxKeepAlivePulse() {
+  // Skip during circuit-open window — the circuit breaker already gave MLX a break
+  if (typeof _isEmbedCircuitOpen === 'function' && _isEmbedCircuitOpen()) {
+    _mlxKeepAliveTimer = setTimeout(_mlxKeepAlivePulse, mlxAvailable ? MLX_KEEPALIVE_INTERVAL_MS : MLX_KEEPALIVE_RECOVERY_MS);
+    return;
+  }
+
+  try {
+    const result = await mlxEmbed('ping');  // tiny prompt (~5 tokens, <100ms healthy)
+    // success path
+    if (_mlxKeepAliveStreak > 0) {
+      console.log(`[mlx-keepalive] recovered after ${_mlxKeepAliveStreak} fails`);
+    }
+    _mlxKeepAliveStreak = 0;
+    if (!mlxAvailable && result && result.length > 0) {
+      mlxAvailable = true;
+      console.log('[mlx-keepalive] mlxAvailable restored by probe');
+    }
+  } catch (e) {
+    _mlxKeepAliveStreak++;
+    console.log(`[mlx-keepalive] fail streak=${_mlxKeepAliveStreak}: ${e.message?.slice(0, 80)}`);
+    if (_mlxKeepAliveStreak >= MLX_KEEPALIVE_FAIL_THRESHOLD && mlxAvailable) {
+      mlxAvailable = false;
+      console.log(`[mlx-keepalive] marked MLX unavailable after ${_mlxKeepAliveStreak} consecutive fails`);
+    }
+  }
+
+  // Reschedule with adaptive interval
+  const nextMs = mlxAvailable ? MLX_KEEPALIVE_INTERVAL_MS : MLX_KEEPALIVE_RECOVERY_MS;
+  _mlxKeepAliveTimer = setTimeout(_mlxKeepAlivePulse, nextMs);
+}
+
 function _mlxEmbedRaw(text) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ model: MLX_DEFAULT_MODEL, prompt: sanitizeEmbedText(text) });
@@ -5595,8 +5665,46 @@ function _mlxEmbedRaw(text) {
   });
 }
 
-// Public API — serialized via mutex to prevent GPU contention
-function mlxEmbed(text) { return withMlxLock(() => _mlxEmbedRaw(text)); }
+// MLX embed latency instrumentation (C11 D7 follow-up).
+// Ring buffer of last N successful call durations (ms), per method.
+// Percentiles computed on demand — sort is O(N log N) on N=256 (~microseconds),
+// acceptable because /ai/latency + anomaly check are not hot paths.
+// On error we DO NOT record — failed calls have different timing distribution
+// (timeouts clip at req.timeout) and would bias tail percentiles.
+const MLX_LATENCY_RING_SIZE = 256;
+const _mlxLatencyRing = {
+  single: { times: new Array(MLX_LATENCY_RING_SIZE).fill(NaN), idx: 0, n: 0 },
+  batch:  { times: new Array(MLX_LATENCY_RING_SIZE).fill(NaN), idx: 0, n: 0 },
+};
+
+function _recordMlxLatency(kind, elapsedMs) {
+  const r = _mlxLatencyRing[kind];
+  if (!r) return;
+  r.times[r.idx] = elapsedMs;
+  r.idx = (r.idx + 1) % MLX_LATENCY_RING_SIZE;
+  r.n = Math.min(r.n + 1, MLX_LATENCY_RING_SIZE);
+}
+
+function _mlxLatencyStats(kind) {
+  const r = _mlxLatencyRing[kind];
+  if (!r || r.n === 0) return { p50: null, p95: null, p99: null, n: 0 };
+  const xs = r.times.slice(0, r.n).filter(x => Number.isFinite(x)).sort((a, b) => a - b);
+  if (xs.length === 0) return { p50: null, p95: null, p99: null, n: 0 };
+  const pick = (p) => xs[Math.min(xs.length - 1, Math.floor(xs.length * p))];
+  return { p50: pick(0.5), p95: pick(0.95), p99: pick(0.99), n: xs.length };
+}
+
+// Public API — serialized via mutex to prevent GPU contention.
+// Wraps _mlxEmbedRaw with latency recording: successful calls update the
+// 'single' ring; errors propagate untouched so the ring is clean.
+function mlxEmbed(text) {
+  return withMlxLock(async () => {
+    const t0 = Date.now();
+    const result = await _mlxEmbedRaw(text);
+    _recordMlxLatency('single', Date.now() - t0);
+    return result;
+  });
+}
 
 // Query-embedding LRU cache + short-timeout variant for the interactive
 // recall path. The background embed loop holds withMlxLock while batching,
@@ -5651,6 +5759,7 @@ function _mlxEmbedBatchRaw(texts, timeoutMs) {
   if (timeoutMs === undefined) {
     timeoutMs = (process.env.VCTX_EMBED_C11_DISABLED === '1') ? 600_000 : 60_000;
   }
+  const t0 = Date.now();
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ texts: texts.map(sanitizeEmbedText), model: MLX_DEFAULT_MODEL, normalize: true });
     const parsed = new URL(`${MLX_EMBED_URL}/embed_batch`);
@@ -5664,7 +5773,12 @@ function _mlxEmbedBatchRaw(texts, timeoutMs) {
       res.on('end', () => {
         try {
           const data = JSON.parse(Buffer.concat(chunks).toString());
-          resolve((data.embeddings || []).map(e => e.embedding || e));
+          const embeddings = (data.embeddings || []).map(e => e.embedding || e);
+          // Record latency ONLY on success — failed calls (timeouts, parse
+          // errors) have a different timing distribution and would bias
+          // tail percentiles.
+          _recordMlxLatency('batch', Date.now() - t0);
+          resolve(embeddings);
         } catch (e) { reject(e); }
       });
     });
@@ -5957,6 +6071,10 @@ function handleAiStatus(req, res) {
       auto_embed: mlxAvailable,
       auto_conflict_resolve: mlxGenerateAvailable,
       semantic_search: mlxAvailable,
+    },
+    latency: {
+      single: _mlxLatencyStats('single'),
+      batch: _mlxLatencyStats('batch'),
     },
   });
 }
@@ -7002,6 +7120,7 @@ const ENDPOINTS_LIST = [
   'GET    /consult/pending?model= — list pending consultations for a model',
   'POST   /consult/auto-respond — batch respond to pending consultations {model, responses[]}',
   'GET    /ai/status         — local AI (MLX) status and capabilities',
+  'GET    /ai/latency        — MLX embed latency percentiles (p50/p95/p99, single + batch)',
   'POST   /ai/summarize      — summarize entries using local AI {ids?:[]}',
   'GET    /search/semantic?q= — semantic similarity search (&limit=10&threshold=0.5)',
   'POST   /analytics/track   — track usage event {event_type, skill_name?, session?, metadata?}',
@@ -9975,6 +10094,15 @@ const server = createServer(async (req, res) => {
       handleConsultStatus(req, res);
     } else if (method === 'GET' && path === '/ai/status') {
       handleAiStatus(req, res);
+    } else if (method === 'GET' && path === '/ai/latency') {
+      // MLX embed latency percentiles from the rolling ring buffer.
+      // Useful for diagnosing anomaly #10 (p95 regression) and tail-latency
+      // questions that /ai/status can't answer on its own.
+      sendJson(res, 200, {
+        single: _mlxLatencyStats('single'),
+        batch: _mlxLatencyStats('batch'),
+        ring_size: MLX_LATENCY_RING_SIZE,
+      });
     } else if (method === 'POST' && path === '/ai/summarize') {
       await handleAiSummarize(req, res);
     } else if (method === 'GET' && path === '/search/semantic') {
@@ -10236,4 +10364,9 @@ server.listen(PORT, BIND_HOST, () => {
   // the DBs are open (synchronous ensure* ran before this point), and the
   // endpoints list is printed. /startup flips 503 → 200 from here on.
   globalThis._startupCompleteAt = new Date().toISOString();
+
+  // MLX keep-alive probe — 10s after boot to let MLX finish initializing.
+  // Adaptive self-scheduling: 30s when healthy, 2min when unavailable.
+  if (_mlxKeepAliveTimer) clearTimeout(_mlxKeepAliveTimer);
+  _mlxKeepAliveTimer = setTimeout(_mlxKeepAlivePulse, 10000);
 });
