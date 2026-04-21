@@ -6,6 +6,7 @@
 #   - snapshot: .backup to SSD (once per day, keep last 7)
 set -u
 
+SKILLS_DIR="$HOME/skills"
 NODE="/Users/mitsuru_nakajima/.nvm/versions/node/v25.9.0/bin/node"
 HOOK="/Users/mitsuru_nakajima/skills/scripts/vcontext-hooks.js"
 SNAP_DIR="/Users/mitsuru_nakajima/skills/data/snapshots"
@@ -209,7 +210,6 @@ if [[ -n "$CUR_P95" ]] && [[ -n "$BASE_P95" ]] \
 fi
 
 # 10. Upstream sync (was self-evolve) — check git remote for updates
-SKILLS_DIR="$HOME/skills"
 if [ -d "$SKILLS_DIR/.git" ]; then
   cd "$SKILLS_DIR"
   git fetch origin 2>/dev/null
