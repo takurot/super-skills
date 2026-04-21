@@ -2305,6 +2305,102 @@ function handleHealth(req, res) {
 }
 
 /**
+ * GET /live — Kubernetes-style liveness probe.
+ *
+ * Cheapest possible check: "is this Node process still responsive?"
+ * No DB touch (a DB issue is not the same as a dead process), no MLX
+ * touch, no filesystem stat. Target response < 5 ms even under load.
+ * Fail → supervisor should SIGKILL & restart.
+ */
+function handleLive(req, res) {
+  sendJson(res, 200, {
+    alive: true,
+    pid: process.pid,
+    uptime_seconds: Math.floor(process.uptime()),
+    version: process.env.VCTX_VERSION || null,
+  });
+}
+
+/**
+ * GET /ready — Kubernetes-style readiness probe.
+ *
+ * "Can I safely accept traffic right now?" 503 while a VACUUM or BACKUP
+ * is in flight (both block the event loop / take the write lock), so a
+ * load balancer drains us before we stall requests. MLX is intentionally
+ * NOT required — semantic search can degrade, but /store and /recall
+ * must keep working when the embedder is down.
+ */
+function handleReady(req, res) {
+  const reasons = [];
+
+  // ramDb trivial query
+  let ramDbOk = false;
+  try {
+    if (ramDb) {
+      const row = ramDb.prepare('SELECT 1 AS ok').get();
+      ramDbOk = row?.ok === 1;
+    }
+  } catch { /* ramDbOk stays false */ }
+  if (!ramDbOk) reasons.push('ramDb_unreachable');
+
+  // ssdDb trivial query
+  let ssdDbOk = false;
+  try {
+    if (ssdDb) {
+      const row = ssdDb.prepare('SELECT 1 AS ok').get();
+      ssdDbOk = row?.ok === 1;
+    }
+  } catch { /* ssdDbOk stays false */ }
+  if (!ssdDbOk) reasons.push('ssdDb_unreachable');
+
+  // In-flight maintenance operations that block writes / the event loop.
+  if (globalThis._backupInFlight) reasons.push('backup_in_flight');
+  if (globalThis._vacuumInFlight) reasons.push('vacuum_in_flight');
+
+  const ready = reasons.length === 0;
+  sendJson(res, ready ? 200 : 503, {
+    ready,
+    ram_db: ramDbOk,
+    ssd_db: ssdDbOk,
+    mlx_available: mlxAvailable,  // informational only — not a gate
+    reasons,
+  });
+}
+
+/**
+ * GET /startup — Kubernetes-style startup probe.
+ *
+ * Separate from /live so a slow boot (SSD restore / sqlite-vec load /
+ * backfillIndex on a 9 GB DB) doesn't get the process killed by the
+ * liveness probe. Probe returns 503 until `_startupCompleteAt` is set
+ * at the very end of `server.listen()`'s callback.
+ */
+function handleStartup(req, res) {
+  const complete = !!globalThis._startupCompleteAt;
+  if (!complete) {
+    // Best-effort phase guess — not authoritative, just a breadcrumb.
+    let phase = 'init';
+    if (!ramDb) phase = 'ramdb-init';
+    else if (!ssdDb) phase = 'ssddb-init';
+    else if (!vecDb) phase = 'vec-load';
+    return sendJson(res, 503, {
+      startup_complete: false,
+      phase,
+      uptime_seconds: Math.floor(process.uptime()),
+    });
+  }
+  sendJson(res, 200, {
+    startup_complete: true,
+    startup_completed_at: globalThis._startupCompleteAt,
+    boot_elapsed_seconds: Math.max(
+      0,
+      Math.floor(process.uptime()) -
+        Math.floor((Date.now() - Date.parse(globalThis._startupCompleteAt)) / 1000)
+    ),
+  });
+}
+
+/**
  * GET /trace/:id — Pillar 3 (Causal Observability).
  *
  * Walk the causal ancestry of an entry by following parent_id pointers.
@@ -6885,7 +6981,10 @@ const ENDPOINTS_LIST = [
   'POST   /summarize         — compact old entries',
   'GET    /stats             — database statistics',
   'DELETE /prune             — remove old entries',
-  'GET    /health            — health check',
+  'GET    /health            — health check (legacy combined probe)',
+  'GET    /live              — liveness probe (process alive? <5ms, no DB)',
+  'GET    /ready             — readiness probe (accept traffic? DB + no in-flight VACUUM/BACKUP)',
+  'GET    /startup           — startup probe (boot complete? DB restore + vec.db loaded)',
   'GET    /feed?since=       — activity feed since timestamp (&exclude_user=userId)',
   'POST   /tier/migrate      — trigger tier migration',
   'GET    /tier/stats        — per-tier statistics',
@@ -7004,6 +7103,12 @@ const server = createServer(async (req, res) => {
       handlePrune(req, res);
     } else if (method === 'GET' && path === '/health') {
       handleHealth(req, res);
+    } else if (method === 'GET' && path === '/live') {
+      handleLive(req, res);
+    } else if (method === 'GET' && path === '/ready') {
+      handleReady(req, res);
+    } else if (method === 'GET' && path === '/startup') {
+      handleStartup(req, res);
     } else if (method === 'GET' && /^\/trace\/\d+$/.test(path)) {
       // Pillar 3 — Causal ancestry walk. Returns root-to-target chain
       // via parent_id pointers plus immediate children.
@@ -8330,8 +8435,15 @@ const server = createServer(async (req, res) => {
         // Execute VACUUM. WARNING: blocks event loop for the duration.
         // With the size guard above this path only runs when DB
         // <= MAX_BYTES (or caller explicitly opted into large-DB stall).
+        // _vacuumInFlight lets /ready return 503 during the stall so a
+        // load balancer drains this instance.
         const startT = Date.now();
-        ramDb.exec('VACUUM;');
+        globalThis._vacuumInFlight = true;
+        try {
+          ramDb.exec('VACUUM;');
+        } finally {
+          globalThis._vacuumInFlight = false;
+        }
         let dbSizeAfter = dbSizeBefore;
         try {
           dbSizeAfter = require('node:fs').statSync(DB_PATH).size;
@@ -10120,4 +10232,8 @@ server.listen(PORT, BIND_HOST, () => {
   for (const ep of ENDPOINTS_LIST) {
     console.log(`  ${ep}`);
   }
+  // Startup-probe marker: boot fully complete once the listener is bound,
+  // the DBs are open (synchronous ensure* ran before this point), and the
+  // endpoints list is printed. /startup flips 503 → 200 from here on.
+  globalThis._startupCompleteAt = new Date().toISOString();
 });
