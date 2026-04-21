@@ -77,6 +77,14 @@ const BACKUP_PATH = join(BACKUP_DIR, 'vcontext-backup.sqlite');
 const SSD_DB_PATH = join(BACKUP_DIR, 'vcontext-ssd.db');
 const ENTRIES_WAL_PATH = join(BACKUP_DIR, 'entries-wal.jsonl'); // SQLite-independent append-only log
 const ENTRIES_WAL_MAX_BYTES = 500 * 1024 * 1024; // 500MB, then rotate
+// Defense-in-depth: hard cap on POST /store content size.
+// Measured 2026-04-21: max content in DB = 500 KiB (hooks.js:1418 already
+// truncates to 500000 chars), zero entries > 1 MiB. A 1 MiB reject guard
+// therefore breaks no current caller. Separate from H9 (disk-full ➜ FTS5
+// blob corruption) — this is a latent gap that should be closed regardless.
+const VCTX_STORE_MAX_CONTENT_BYTES = parseInt(
+  process.env.VCTX_STORE_MAX_CONTENT_BYTES || String(1024 * 1024), 10
+);
 
 // Serialized writer for entries-wal.jsonl. Node's fs.appendFile opens+
 // writes+closes on every call — concurrent callers can interleave.  This
@@ -1448,6 +1456,20 @@ async function handleStore(req, res) {
   }
   if (content.length === 0) {
     return sendJson(res, 400, { error: 'content must be non-empty string.' });
+  }
+
+  // Defense-in-depth size guard: reject oversized content before any DB
+  // write so FTS5 never sees a blob that could induce index corruption
+  // if the disk happens to be full. Uses utf-8 byte length (not .length,
+  // which is utf-16 code units) so multibyte text is measured accurately.
+  const contentBytes = Buffer.byteLength(content, 'utf8');
+  if (contentBytes > VCTX_STORE_MAX_CONTENT_BYTES) {
+    console.warn(`[store] rejected oversized content: ${contentBytes}B > ${VCTX_STORE_MAX_CONTENT_BYTES}B (type=${type}, session=${session})`);
+    return sendJson(res, 413, {
+      error: 'content_too_large',
+      byte_length: contentBytes,
+      max_bytes: VCTX_STORE_MAX_CONTENT_BYTES
+    });
   }
 
   // Global dedup via content_hash + UNIQUE index (atomic, race-free).
