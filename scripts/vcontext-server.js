@@ -5604,7 +5604,7 @@ function withMlxLock(fn) {
 // code (/store, semantic search, embed loop) already gates on mlxAvailable.
 let _mlxKeepAliveStreak = 0;
 let _mlxKeepAliveTimer = null;
-const MLX_KEEPALIVE_INTERVAL_MS = 30000;      // 30s when healthy
+const MLX_KEEPALIVE_INTERVAL_MS = 10000;      // 10s when healthy — pin 3.4GB model pages hot
 const MLX_KEEPALIVE_RECOVERY_MS = 120000;     // 2min when unavailable (less pressure)
 const MLX_KEEPALIVE_FAIL_THRESHOLD = 2;       // 2 consecutive fails → mark unavailable
 
