@@ -1538,6 +1538,51 @@ async function recordEvent(eventName, preReadInput) {
             });
           }
 
+          // M1 passive skill-invocation audit (AIOS self-steering spec M1).
+          // Measures: how often were skills ROUTED via [infinite-skills]
+          // vs how often did the AI actually INVOKE the Skill tool?
+          // Ratio=0 means "matched but never applied" — the discipline
+          // gap that prompted this whole effort. Passive: no blocking,
+          // one DB write per session end. Baseline data for later M2/M3.
+          // Simulation 2026-04-22 on this session: 234 matches / 0
+          // invocations / rate=0.000 — exactly the gap to be quantified.
+          try {
+            const usage = await get(`/session/${encodeURIComponent(sessionId)}?type=skill-usage&limit=1000`);
+            const uniqueMatched = new Set();
+            let matchEvents = 0;
+            for (const row of (usage.results || [])) {
+              try {
+                const d = JSON.parse(row.content);
+                if (Array.isArray(d.skills) && d.skills.length) {
+                  matchEvents++;
+                  for (const s of d.skills) uniqueMatched.add(s);
+                }
+              } catch {}
+            }
+            const tu = await get(`/session/${encodeURIComponent(sessionId)}?type=tool-use&limit=1000`);
+            let skillInvocations = 0;
+            for (const row of (tu.results || [])) {
+              try {
+                const d = JSON.parse(row.content);
+                if (d.tool_name === 'Skill') skillInvocations++;
+              } catch {}
+            }
+            const ratio = matchEvents > 0 ? skillInvocations / matchEvents : 0;
+            await post('/store', {
+              type: 'skill-invocation-audit',
+              content: JSON.stringify({
+                session: sessionId,
+                skills_matched_events: matchEvents,
+                unique_matched_skills: [...uniqueMatched].sort(),
+                skill_tool_invocations: skillInvocations,
+                invocation_rate: Number(ratio.toFixed(4)),
+                audited_at: new Date().toISOString(),
+              }),
+              tags: ['skill-invocation-audit', 'm1-passive', 'auto'],
+              session: sessionId,
+            });
+          } catch {}
+
           // Handoff: leave a note for the next session in the same cwd.
           // Captures the last assistant message + last user prompt so a
           // follow-up session (possibly under a different account) can
