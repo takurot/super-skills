@@ -1,198 +1,144 @@
 # Next-Session Kickoff — 2026-04-23
 
-*Session 905f38bd continued into 2026-04-22 morning/afternoon; then
-session 28d38f34 resumed mid-afternoon. Focus: user goal = "stability +
-MLX 常時稼働". Yesterday (04-21) fixed the SIGKILL-137 storm via DB
-shrink + jetsam-aware tuning. Today (04-22) pivoted to observability +
-MLX memory hygiene verification + "zero error rate" pursuit.*
+*Session 28d38f34 (2026-04-22 evening, ~4.5h). 16 commits shipped +
+7 evidence files. Major outcomes: MLX embed runs as cat=app pri=100,
+AIOS self-steering loop M1+M4 live, correction-event pipeline wired.*
 
 ---
 
-## Session-start ritual (3 min)
+## Session-start ritual (2 min)
 
-```
-# 1. Health baseline
-curl -sS http://127.0.0.1:3150/health | grep -q healthy && echo "vcontext OK"
-curl -sS http://127.0.0.1:3161/health | grep -q healthy && echo "mlx-embed OK"
+```bash
+# 1. Health baselines
+curl -sS http://127.0.0.1:3150/health | python3 -c "import json,sys;d=json.load(sys.stdin);print('vcontext:',d['status'],'mlx:',d['mlx_available'])"
+curl -sS http://127.0.0.1:3161/api/health | python3 -c "import json,sys;d=json.load(sys.stdin);print('mlx-embed backend:',d['backend'])"
 
-# 2. MLX kill freshness (is the jetsam loop active?)
-sqlite3 ~/skills/data/vcontext-primary.sqlite \
-  "SELECT COUNT(*) FROM entries WHERE type='anomaly-alert' AND content LIKE '%mlx-embed exit%' AND created_at >= datetime('now','-1 hour');"
-# target: 0 when system is idle / 1-5 is the jetsam loop active
+# 2. Jetsam state (should still be app/100)
+APP=$(launchctl list | awk '$3 ~ /^application\.com\.vcontext\.mlx-embed-standalone/ {print $3}' | head -1)
+launchctl print gui/$(id -u)/"$APP" 2>&1 | grep -E "jetsam priority|jetsamproperties category"
 
-# 3. Backlog drain trend
-curl -sS http://127.0.0.1:3150/ai/status | python3 -c "import json,sys;d=json.load(sys.stdin);print(f'backlog={d[\"embedding_backlog\"]:,} embed_count={d[\"embedding_count\"]:,}')"
+# 3. M1-M4 loop pulse
+curl -sS "http://127.0.0.1:3150/recent?type=skill-invocation-audit&n=3" | python3 -c "import json,sys; [print('  audit:',x.get('created_at','?'),'matched=',json.loads(x['content']).get('skills_matched_events'),'invoked=',json.loads(x['content']).get('skill_tool_invocations')) for x in json.load(sys.stdin).get('results',[])[:3]]"
 
-# 4. MLX latency snapshot (new /ai/latency endpoint)
-curl -sS http://127.0.0.1:3150/ai/latency | python3 -m json.tool
+# 4. Swap (was 14.86→12.96 GB trending down; expect continued drop)
+sysctl -n vm.swapusage
 ```
 
-If jetsam loop is active: that's the known-accepted pattern per user
-decision (overnight-drain strategy). Not a regression.
-
 ---
 
-## What shipped 2026-04-22 (7 commits)
+## Tonight's 16 commits (2026-04-22 evening)
 
 ```
-5f6ed4a fix(watcher): graceful skip when no LLM available (A-alt)
-95674e3 tune(mlx): keep-alive 30s→10s — pin 3.4GB model pages hot
-39bbaee feat(mlx): keep-alive probe + latency instrumentation
-0486713 fix(maintenance): SKILLS_DIR unbound at line 172
-97ad526 feat(server): D2 — 3-tier probes /live, /ready, /startup
-fc1094e feat(anomaly): RTOS-style cycle duration + jitter tracking (D1)
-e75da6e fix(anomaly): RAM/SSD gap excludes SKIP_TYPES (false-positive fix)
-e7813dc feat(server): detectAnomalies Check #8 — launchd service health
+6ba7e52  docs(analysis): 3 independent-agent audits (mlx-generate + silent-catches + M2-M6)
+b5d9a49  feat(hooks): LLM-enriched correction analysis (mlx-generate primary)
+4d50259  feat(hooks): auto-detect user correction events + surface at bootstrap
+e78d91c  fix(anomaly,hooks): post-review M1/M4 fixes (dedup + db-errors scope)
+7c2f88b  feat(hooks): M4 bootstrap surfacing of anomaly skill-triggers
+6101359  feat(hooks): M1 passive skill-invocation audit at session-end
+606192d  feat(anomaly): route async launchd-unhealthy probe → respondToAnomalies
+79871d3  fix(ai-status): split embedding_backlog into eligible / skipped / raw
+42215e3  docs(handoff): AIOS self-steering meta-loop spec (M1-M6)
+28fa60a  feat(anomaly): wire 6 unconnected alerts → skill-trigger reactive
+85f8d55  docs(analysis): phase review + vcontext incompleteness audit
+ea6ed8d  docs(analysis): 2026-04-22 pre-existing MLX pipeline issues
+bd4cdeb  observability(vcontext): prepend ISO-8601 timestamps to console.*
+3356d68  feat(mlx): standalone .app — jetsam cat=daemon→cat=app (pri 40→100)
 ```
-
-Plus plist updates (not commits):
-- com.vcontext.mlx-embed.plist: added ProcessType=Interactive +
-  LowPriorityIO=false (JetsamProperties tried but DOESN'T WORK for user
-  LaunchAgents — lesson recorded).
+(Plus `41f205c` / `9a7eee0` / `5f6ed4a` from earlier in the day.)
 
 ---
 
-## Major findings 2026-04-22
+## Key outcomes
 
-### 1. MLX latency breakdown (evidence from /ai/latency)
-- **Single embed p50: 13ms** when keep-alive cache is warm (probe uses "ping", MLX server has text-level cache)
-- **Batch embed p50: 3.8-22s** depending on swap pressure
-- Cache hit explains the paradox of "slow drain but fast user-facing"
-- Ring size 256, auto-rotates
+### 1. MLX embed runs as `cat=app pri=100`
+- Cutover at 19:16 JST via `/usr/bin/open -W -n -a MLXEmbedServerStandalone.app`
+- **Latency improved**: p50 -23%, p95 -72%, top-3 retrieval identical to mlx_lm baseline
+- **Post-cutover monitor: 40/40 OK, 0 FAIL**
+- Physical footprint 4.2 GB (vmmap). psutil-reported RSS is misleading (mmap swap).
 
-### 2. jetsam priority 40 is IMMUTABLE for user LaunchAgents
-- Researched + tested: `JetsamProperties` plist key is silently ignored
-  for ~/Library/LaunchAgents/. Only /Library/LaunchDaemons (sudo) can
-  override.
-- Max effective protection for user-space:
-  `ProcessType=Interactive` + `Nice=-20` + `LowPriorityIO=false` +
-  `KeepAlive` auto-restart
-- Already all set. No further knobs available.
+### 2. AIOS self-steering loop active (M1 + M4)
+- UserPromptSubmit → `skill-usage` entry (matched names)
+- UserPromptSubmit → `correction-event` entry (regex-detected, 10 JP/EN patterns)
+- respondToAnomalies → `skill-trigger` entry (anomaly-reactive, keywords)
+- session-recall surfaces anomaly triggers + corrections at bootstrap
+- session-end writes `skill-invocation-audit` (matched vs invoked ratio)
+- **M1 verified: 6 real audit entries, rate=0.000 baseline captured**
+- **M4 verified: empirical session-recall invoke shows "Recent Anomaly Skill-Triggers" section with db-errors entries**
 
-### 3. MLX 3.4GB model gets swapped under daytime memory pressure
-- Competing apps (Antigravity 810MB, Claude 665MB, Codex 499MB,
-  Chrome multi ~1.4GB, vcontext-server 463MB) compete for ~36GB RAM
-- MLX RSS oscillates 250MB-3.4GB — OS pages out 3GB of model weights
-  between requests; keep-alive 10s only touches a fraction
-- **User's overnight-drain strategy**: daytime = batch slow (swap), night
-  = apps idle → RAM frees → drain accelerates. Accepted design.
+### 3. Correction-event pipeline
+- Regex fast path → `correction-event` (needs_enrichment=true) at hook time
+- `cmdEnrichCorrections` uses mlx-generate :3162 primary, Claude API fallback, graceful-skip
+- session-recall prefers TIER 1 (analysis) → falls back to TIER 2 (raw snippet)
+- **Currently 0 correction-events stored** (detection fires going forward only)
 
-### 4. Keep-alive pattern confirmed
-- 10s interval, same "ping" text → MLX server cache hit → 6-14ms/probe
-- Silent on success (spec) — Agent 1 initially flagged it as "INACTIVE"
-  but /ai/latency n growth showed it WAS running
-- Don't lower below 10s (would stress withMlxLock queue)
-
-### 5. mlx-embed-server.py is already state-of-art for user-space
-- `mx.metal.clear_cache()` called every batch (line 370)
-- `gc.collect()` after every batch (line 371)
-- `mx.metal.set_cache_limit(5GB)` at startup
-- External research (Ollama / oMLX / MLX community) showed only SSD-
-  tier cache as a non-implemented pattern — but Phase A was DEFERRED
-  because backlog = unique text = 0% cache hit rate.
+### 4. Fixed pre-existing bugs
+- `embedding_backlog` metric: now splits eligible / raw / skipped (was permanently 60k false-positive)
+- `db-errors` alert detector: gates on process start time (no more re-scanning pre-restart corruption)
+- anomaly-response: 4/13 → 11/13 alert types now have response branches
 
 ---
 
-## Decisions captured 2026-04-22
+## Open questions (block M2-M6 progression)
 
-- **A-alt (new-feature-watcher graceful skip)**: Don't pay for Anthropic
-  API just to silence a nice-to-have daily alert. Script now exits 0
-  on "ANTHROPIC_API_KEY not set" (commit 5f6ed4a).
-- **Overnight-drain strategy for MLX backlog**: daytime accept slow
-  batch (22s), nighttime drain naturally (other apps idle → RAM free).
-  (vcontext decision id=234497 stored 2026-04-21 evening.)
-- **Don't lower keep-alive below 10s**: would stress withMlxLock
-  serialization.
-- **Don't try to raise MLX jetsam priority**: user-space can't.
-  Accept occasional jetsam kill + rely on launchctl auto-restart.
+User must decide these before M2 phase-2 (gate mode) can ship:
 
----
+1. **M2 denominator**: AI-assertion gate triggers on ALL "done/complete/100%" claims, or production-critical-only?
+2. **Bypass phrase**: unified `force:` for all mechanisms, or per-mechanism?
+3. **PreToolUse block scope**: Edit / Write / Task only, or also Bash / Agent?
+4. **M5 backfill**: retrospectively run M5 on today's session (session 905f38bd)?
+5. **M6 `careful`-skill trigger**: keyword precision vs recall balance?
+6. **evidence-gate log retention**: TTL for per-session audit data?
 
-## Remaining work (prioritized)
-
-### Unblocked / ready to pick up (参照系 first, 更新系 second, 5-step flow)
-1. **backup exit=52 origin** — Check #8 anomaly surfaced a new LaunchAgent
-   failure. Script at `scripts/vcontext-backup.sh`. Exit 52 is non-
-   standard; could be curl timeout (28), pipefail, or custom code.
-   Needs: grep the script, find exit paths, correlate with log.
-
-2. **conversation-skill-miner exit=1** — Another Check #8 newcomer.
-   LaunchAgent runs daily. Same pattern as new-feature-watcher — likely
-   needs API key. A-alt approach (graceful skip) is a good template.
-
-3. **(4) Model pre-load at startup** — mlx-embed-server.py currently
-   lazy-loads on first request; a `mx.eval(dummy_input)` at startup
-   would eliminate cold-start on every launchd restart. ~20 LOC.
-   Consider after the 2 exit-code triages above.
-
-### Deferred (evidence suggests low ROI)
-4. **(3) Metal cache 5GB limit test** — Agent C suggested disabling
-   to see if latency improves. Test is mlx-embed restart cycle (which
-   itself loses warmth), so measurement is noisy. Defer until there's
-   evidence the 5GB cap is actually the bottleneck.
-
-5. **SSD cache tier (Phase A)** — DEFERRED. Backlog = unique texts →
-   0% cache-hit impact on drain. Only helps rare repeat /recall. Not
-   worth the complexity right now.
+These are documented in `docs/analysis/2026-04-22-m2-m3-m5-m6-feasibility.md`.
 
 ---
 
-## Do NOT do these (2026-04-22 lessons)
+## Next-session queued work (prioritized, from tonight's 3 audits)
 
-- **Do NOT promote mlx-embed to /Library/LaunchDaemons without explicit
-  discussion** — it works around jetsam but requires sudo install and
-  MLX process runs as root. Security tradeoff not yet approved.
-- **Do NOT drop keep-alive interval below 10s** — withMlxLock queue
-  pressure would delay user-facing /store backfills.
-- **Do NOT enable com.vcontext.mlx-generate without re-evaluating RAM
-  budget** — it adds 6 GB resident, would worsen jetsam loop.
-- **Do NOT run sqlite3 CLI UPDATE/DELETE on live DB** unless you know
-  WAL-mode concurrency intimately. Yesterday's near-corruption came
-  from mixing CLI + server writers. Prefer `POST /admin/*` endpoints
-  or stop server first.
+### Tier 1 (immediate, small)
+- [ ] **Fix 5 silent catches** per silent-catches-structuring.md top-5 list (~24 LOC). Biggest impact: `server.js:1636` which masks the ECONNREFUSED+backlog mechanism.
+- [ ] **Verify M1 continues to fire** after this handoff + tomorrow's session. Expect new `skill-invocation-audit` entries with the NEW session IDs.
+- [ ] **Verify M4 surfaces today's anomaly triggers** — next session-start should render the db-errors skill-trigger (if still within the FTS relevance window).
 
----
+### Tier 2 (medium, decision-dependent)
+- [ ] **mlx-generate re-enable decision**: staged-test path in mlx-generate-reenable-analysis.md, blocked on swap < 4GB + overnight timing. NOT yet safe per audit — swap 90% saturated.
+- [ ] **Enrich accumulated correction-events**: mlx-generate first needs to be up; then `vcontext-hook-wrapper.sh enrich-corrections 10`.
 
-## Decisions stored in vcontext (SKAP)
-
-- `id=aios-core-principle` (id=233105) — retain/learn/grow, local is
-  a phase
-- `id=mlx-overnight-drain-strategy` (id=234497) — day=accept slow,
-  night=natural drain
-- `id=keepalive-text-cache-amplifier` (id=234500) — same-text probe
-  hits cache, 500× latency improvement
-
-## Lessons stored in vcontext (SKAP, session=aios-shared-knowledge)
-
-- `sqlite-recovery-invariant-violation` (id=232898)
-- `pkill-9-cascade-during-sqlite-operation` (id=232899)
-- `serial-root-cause-declarations` (id=232900)
-- `zombie-fd-after-file-swap` (id=232901)
-- `speculative-correlation-as-mechanism` (id=232902)
-- `recovery-infrastructure-underestimation` (id=233106)
-- `jetsam-user-launchagent-restriction` (id=TBD — stored 2026-04-22
-  morning, see keepalive-text-cache entry sibling)
+### Tier 3 (spec-level, ~17h total)
+- [ ] M2-shadow (2h) — log-only pre-claim evidence gate
+- [ ] M5 (2h) — session-end retrospective entry
+- [ ] M2-nudge (4h)
+- [ ] M3 (4h) — second-opinion reminder injection (soften "auto-spawn")
+- [ ] M2-gate (2h)
+- [ ] M6 (3h) — production-freeze with 4 guards
 
 ---
 
-## Rollback paths
+## Rollback safety nets (untouched tonight)
 
-- **A-alt graceful skip**: revert commit 5f6ed4a
-- **Keep-alive interval**: revert commit 95674e3 (30s default)
-- **Keep-alive + latency instrumentation**: revert 39bbaee
-- **3-tier probes**: revert 97ad526 (keep /health, drop /live /ready /startup)
-- **Cycle duration tracking (D1)**: revert fc1094e
-
-## Recovery points available
-
-- vcontext-backup.sqlite (hourly, auto)
-- vcontext-primary.sqlite (current, healthy, 3.55 GB)
-- snapshots/daily-20260421-0754.db (yesterday, 8.8 GB pre-migration)
-- vcontext-vec.db (all embeddings, independent binary)
-- entries-wal.jsonl (append-only log, replay via /admin/replay-wal)
+- `mlx-embed-server.py` (original) — intact, not deleted
+- `com.vcontext.mlx-embed.plist.bak-20260422-191626` — pre-cutover plist backup
+- `/tmp/mlx-cutover.sh` (164 lines, auto-rollback on failure) — re-runnable
+- Git: all 16 commits on `main`, no force-pushes, no reset
 
 ---
 
-*Next session: start with backup exit=52 + conversation-skill-miner
-exit=1 triage (both参照系 30 min total), then decide (4) model pre-load
-vs session close.*
+## Do NOT do these (tonight's lessons)
+
+1. **Do not declare "0 errors" without filtering timestamps** — the log pre-cutover has 224 real errors from a prior corruption cascade. Time-filter (2026-04-22T13: onwards for post-fix era).
+2. **Do not replace regex detector with LLM-only** — the user's explicit directive: regex is fast-path for unenriched events; LLM enriches when available. Two-tier design.
+3. **Do not ask "shall I proceed?" between consecutive atomic tasks** — user called this out as "先延ばし"; execute the queue sequentially.
+4. **Do not claim skill application without actually invoking the skill tool** — M1 now measures this; rate=0 baseline is the gap we're closing.
+
+---
+
+## Decisions stored in vcontext this session (SKAP)
+
+Not formally stored (inline reasoning only). Consider on next session:
+- `mlx-app-wrapper-for-jetsam` — bash-wrapper .app beats Nuitka for cat=app goal
+- `ratio-zero-baseline` — 2026-04-22 905f38bd session measured 234 matches / 0 invocations
+- `swap-90-blocks-mlx-generate` — don't re-enable until swap < 4GB + overnight
+
+---
+
+*End of handoff. Session closing at ~22:30 JST. Production green.*
