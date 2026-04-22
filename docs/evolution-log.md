@@ -939,3 +939,123 @@ pattern from Constitution Axiom 4 working as designed.
 **Crash count**: 6 SIGKILL-137 (all pre-cleanup or during VACUUM transition); steady state post-cleanup = 0
 
 **Next session**: see `docs/handoff/2026-04-22-next-session-kickoff.md`
+
+## 2026-04-21 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 5 | Skills created: 0
+- Embedding: 3269/4699 | Sessions: 48
+- Upstream: 0 commits behind
+
+## 2026-04-21 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 5 | Skills created: 0
+- Embedding: 3134/4576 | Sessions: 47
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 5 | Skills created: 0
+- Embedding: 3133/4588 | Sessions: 47
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 5 | Skills created: 0
+- Embedding: 3133/4602 | Sessions: 47
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 5 | Skills created: 0
+- Embedding: 3134/4612 | Sessions: 47
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 5 | Skills created: 0
+- Embedding: 3132/4619 | Sessions: 47
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 5 | Skills created: 0
+- Embedding: 3133/4633 | Sessions: 47
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 5 | Skills created: 0
+- Embedding: 3134/4654 | Sessions: 47
+- Upstream: 0 commits behind
+
+## 2026-04-21 — evolution-cycle 2026-16
+
+**Type**: evolution-cycle (weekly scheduled)
+**Weights used**: w1=0.25, w2=0.25, w3=0.2, w4=0.2, w5=0.1
+**Candidates gathered**: total=7, by source={"self_improve":7}
+**Top-K scored**: 3
+**Pending-patches emitted**: 0
+**Observation mode**: yes
+**Notes**: observation mode: Phase (c)-(e) skipped
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 5 | Skills created: 0
+- Embedding: 3135/4657 | Sessions: 47
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 5 | Skills created: 0
+- Embedding: 3134/4669 | Sessions: 47
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 5 | Skills created: 0
+- Embedding: 3134/4688 | Sessions: 47
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 4 | Skills created: 0
+- Embedding: 3116/4681 | Sessions: 47
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 4 | Skills created: 0
+- Embedding: 3504/5083 | Sessions: 48
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 8 | Skills created: 0
+- Embedding: 3753/5338 | Sessions: 49
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 8 | Skills created: 0
+- Embedding: 3839/5434 | Sessions: 49
+- Upstream: 0 commits behind
+
+## 2026-04-22 — auto (maintenance)
+- Discovery: 0 searches | Suggestions: 9 | Skills created: 0
+- Embedding: 3952/5579 | Sessions: 48
+- Upstream: 0 commits behind
+
+## 2026-04-22 — Session 905f38bd→28d38f34 (MLX observability + "zero error rate" pursuit)
+
+**Type**: stability-observability + memory-hygiene verification
+
+**Shipped** (7 commits):
+- e7813dc — Check #8 launchd service health (detectAnomalies)
+- e75da6e — RAM/SSD gap excludes SKIP_TYPES
+- fc1094e — RTOS cycle duration + jitter (D1)
+- 97ad526 — 3-tier probes /live /ready /startup (D2)
+- 39bbaee — MLX keep-alive probe + latency instrumentation
+- 95674e3 — keep-alive 30s→10s
+- 5f6ed4a — new-feature-watcher graceful skip (A-alt)
+- 0486713 — maintenance.sh SKILLS_DIR ordering fix
+
+**Key findings**:
+- jetsam priority 40 is IMMUTABLE for user LaunchAgents
+  (plist key silently ignored, confirmed by live test)
+- Keep-alive w/ same-text probe hits MLX cache → 500× latency improvement
+- MLX 3.4GB model gets swapped under daytime pressure (RSS 250MB-3.4GB osc.)
+- mlx-embed-server.py already state-of-art for user-space
+  (clear_cache + gc.collect + set_cache_limit all present)
+
+**Decisions**:
+- A-alt for new-feature-watcher (no API key, graceful skip, exit 0)
+- Overnight-drain strategy (day=accept slow, night=natural drain)
+- Don't lower keep-alive below 10s (withMlxLock pressure)
+
+**Next**: backup exit=52 + conversation-skill-miner exit=1 triage,
+then optionally (4) Model pre-load.
