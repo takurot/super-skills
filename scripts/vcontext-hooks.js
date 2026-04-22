@@ -1972,6 +1972,36 @@ async function handleSessionRecall() {
     }
   } catch { /* non-fatal */ }
 
+  // M4: surface reactive skill-triggers from recent anomaly responses
+  // (AIOS self-steering spec M4). When vcontext's respondToAnomalies
+  // emits a `skill-trigger` entry (commit 28fa60a), those keywords
+  // appear here at the NEXT session bootstrap — the AI sees the
+  // anomaly before the user has to remember it. Passive: just
+  // visibility, no forced action. Complements M1 (which measures
+  // whether visibility leads to invocation).
+  try {
+    const st = await get(`/recall?q=anomaly-reactive&type=skill-trigger&limit=5${tk}`);
+    const triggers = (st.results || []).filter(r => {
+      try {
+        const d = JSON.parse(r.content);
+        return Array.isArray(d.keywords) && d.keywords.length > 0 && d.anomaly_kind;
+      } catch { return false; }
+    });
+    if (triggers.length > 0) {
+      lines.push('### Recent Anomaly Skill-Triggers (from earlier sessions)');
+      for (const r of triggers.slice(0, 5)) {
+        try {
+          const d = JSON.parse(r.content);
+          const when = (d.generated_at || '').slice(0, 19).replace('T', ' ');
+          const kw = (d.keywords || []).slice(0, 4).join(', ');
+          const rationale = (d.rationale || '').slice(0, 80).replace(/\s+/g, ' ');
+          lines.push(`- [${d.anomaly_kind}] ${when} — keywords: ${kw}${rationale ? ' — ' + rationale : ''}`);
+        } catch {}
+      }
+      lines.push('');
+    }
+  } catch { /* non-fatal */ }
+
   // Own session entries first
   if (own.results && own.results.length > 0) {
     lines.push('### This Session');
