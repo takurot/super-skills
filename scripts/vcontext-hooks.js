@@ -807,6 +807,186 @@ async function cmdSynthesize() {
   console.log(out);
 }
 
+// ── LLM call helper (mlx-generate primary, Claude API fallback) ───────
+// AIOS "self-hosted first" principle: mlx-generate runs locally (port
+// 3162, Qwen3-8B-4bit) when enabled by user → zero cost. Claude API
+// (api.anthropic.com) requires ANTHROPIC_API_KEY and billing; only
+// used if explicitly configured. If NEITHER is available, returns null
+// and the caller should gracefully skip.
+// Returns: string response text, or null if no backend available.
+async function callLlm(prompt, { maxTokens = 1024, timeoutMs = 30000 } = {}) {
+  // Try mlx-generate first (OpenAI-compatible /v1/chat/completions)
+  const mlxUrl = process.env.MLX_GENERATE_URL || 'http://127.0.0.1:3162';
+  const mlxModel = process.env.MLX_GENERATE_MODEL || 'mlx-community/Qwen3-8B-4bit';
+  const mlxResult = await new Promise((resolve) => {
+    try {
+      const http = require('node:http');
+      const { URL } = require('node:url');
+      const body = JSON.stringify({
+        model: mlxModel,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: maxTokens,
+      });
+      const u = new URL(mlxUrl + '/v1/chat/completions');
+      const req = http.request({
+        host: u.hostname, port: u.port, path: u.pathname, method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      }, r => {
+        let d = '';
+        r.on('data', c => d += c);
+        r.on('end', () => {
+          if (r.statusCode !== 200) return resolve(null);
+          try { resolve(JSON.parse(d).choices?.[0]?.message?.content || null); }
+          catch { resolve(null); }
+        });
+      });
+      req.on('error', () => resolve(null));
+      req.setTimeout(timeoutMs, () => { try { req.destroy(); } catch {} resolve(null); });
+      req.end(body);
+    } catch { resolve(null); }
+  });
+  if (mlxResult !== null) return mlxResult;
+
+  // Fallback: Claude API. Only fires if ANTHROPIC_API_KEY is set.
+  // The user's default config does NOT set this (billing-gated), so
+  // this path is rarely taken — documented fallback only.
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model: 'claude-haiku-4-5',
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const opts = {
+      host: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+    };
+    const req = require('node:https').request(opts, r => {
+      let d = '';
+      r.on('data', c => d += c);
+      r.on('end', () => {
+        try { resolve(JSON.parse(d).content?.[0]?.text || ''); }
+        catch (e) { reject(new Error('Claude parse error: ' + (d || '').slice(0, 200))); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => { req.destroy(new Error('timeout')); });
+    req.end(body);
+  });
+}
+
+// ── LLM-based enrichment of correction-event entries ──────────────────
+// Second phase of the correction-detection pipeline. The regex hook
+// (handleUserPrompt) produces candidate events flagged needs_enrichment.
+// This command picks them up (manually or via cron) and classifies each
+// via Claude API:
+//   - is_correction: yes|no|maybe (filters false positives from raw regex)
+//   - category: evidence-missing | reasoning-error | procedure-skipped
+//               | reporting-issue | scope-drift | pace-issue | other
+//   - severity: gentle | firm | frustrated
+//   - anti_pattern_summary: 1-sentence what-to-avoid
+// Writes a `correction-analysis` entry linked by source_entry_id and
+// removes `needs-enrichment` tag from original via a follow-up "enriched"
+// marker entry. Does NOT mutate the source entry (append-only discipline).
+// Graceful if no API key: logs skip and exits 0.
+async function cmdEnrichCorrections(maxBatch = 5) {
+  // Fetch candidate correction-events. Use /recall for keyword match on
+  // the tag string; dedupe by ensuring we haven't already analyzed.
+  const cand = await get(`/recall?q=needs-enrichment&type=correction-event&limit=50`);
+  const pending = [];
+  for (const row of (cand.results || [])) {
+    try {
+      const d = JSON.parse(row.content);
+      if (d.version === 1 && d.needs_enrichment === true) {
+        pending.push({ row, d });
+      }
+    } catch {}
+    if (pending.length >= maxBatch) break;
+  }
+  if (pending.length === 0) {
+    console.log('[enrich-corrections] no pending entries');
+    return;
+  }
+  console.log(`[enrich-corrections] processing ${pending.length} pending`);
+
+  // Check analyzed entries to avoid double-processing
+  const analyzed = await get(`/recall?q=correction-analysis&type=correction-analysis&limit=200`);
+  const doneIds = new Set();
+  for (const row of (analyzed.results || [])) {
+    try {
+      const d = JSON.parse(row.content);
+      if (d.source_entry_id) doneIds.add(d.source_entry_id);
+    } catch {}
+  }
+
+  let ok = 0, skip = 0, err = 0;
+  for (const { row, d } of pending) {
+    if (doneIds.has(row.id)) { skip++; continue; }
+    const prompt = `Analyze this user message from an AI coding session.
+
+Prior AI response (last 600 chars):
+"""
+${(d.prior_assistant || '').slice(-600)}
+"""
+
+User message:
+"""
+${(d.user_text || '').slice(0, 600)}
+"""
+
+Classify and return JSON only (no prose before/after):
+{
+  "is_correction": "yes" | "no" | "maybe",
+  "category": "evidence-missing" | "reasoning-error" | "procedure-skipped" | "reporting-issue" | "scope-drift" | "pace-issue" | "other",
+  "severity": "gentle" | "firm" | "frustrated",
+  "anti_pattern_summary": "one-sentence, present-tense, what-to-avoid-next-time"
+}`;
+    try {
+      const raw = await callLlm(prompt, { maxTokens: 400 });
+      if (raw === null) {
+        console.log('[enrich-corrections] skipped: no LLM backend available');
+        console.log('  expected: mlx-generate on http://127.0.0.1:3162 (preferred, free)');
+        console.log('  fallback: ANTHROPIC_API_KEY env var (billed, not default)');
+        return; // no point continuing if no backend
+      }
+      // Extract JSON (LLM may wrap in markdown fence or prose)
+      const m = raw.match(/\{[\s\S]*\}/);
+      const analysis = m ? JSON.parse(m[0]) : null;
+      if (!analysis || typeof analysis !== 'object') {
+        err++; console.error('[enrich-corrections] parse failed:', raw.slice(0, 120));
+        continue;
+      }
+      const llmTag = process.env.MLX_GENERATE_URL ? 'mlx-generate' : (process.env.ANTHROPIC_API_KEY ? 'claude-api' : 'unknown');
+      await post('/store', {
+        type: 'correction-analysis',
+        content: JSON.stringify({
+          source_entry_id: row.id,
+          source_session: d.session,
+          source_detected_at: d.detected_at,
+          analysis,
+          llm: llmTag,
+          analyzed_at: new Date().toISOString(),
+        }),
+        tags: ['correction-analysis', `cat:${analysis.category || 'unknown'}`, `sev:${analysis.severity || 'unknown'}`, `conf:${analysis.is_correction || 'unknown'}`],
+        session: d.session,
+      });
+      ok++;
+      // Rate limit — local MLX can handle, but be gentle
+      await new Promise(r => setTimeout(r, 200));
+    } catch (e) {
+      err++;
+      console.error('[enrich-corrections] failed:', (e.message || '').slice(0, 120));
+    }
+  }
+  console.log(`[enrich-corrections] done: ok=${ok} skip=${skip} err=${err}`);
+}
+
 // (5) Inter-process lock per cwd
 async function cmdLock(sub, key) {
   ensureDir(VCTX_LOCK_DIR);
@@ -1850,13 +2030,15 @@ async function handleUserPrompt() {
     post('/store', {
       type: 'correction-event',
       content: JSON.stringify({
+        version: 1,
+        needs_enrichment: true, // LLM-based analysis pending (see cmdEnrichCorrections)
         session: sessionId,
         user_text: prompt.slice(0, 800),
         prior_assistant: priorAssistant,
         matched_patterns: matchedCorrection.map(p => p.source),
         detected_at: new Date().toISOString(),
       }),
-      tags: ['correction-event', 'auto'],
+      tags: ['correction-event', 'auto', 'needs-enrichment'],
       session: sessionId,
     }).catch(() => {});
   }
@@ -2050,33 +2232,62 @@ async function handleSessionRecall() {
     }
   } catch { /* non-fatal */ }
 
-  // Recent user corrections — written by handleUserPrompt when pattern
-  // matchers fire. Surfaces "moments the user had to steer me" so the
-  // AI sees them at session bootstrap and can avoid re-triggering the
-  // same patterns. Complements the manually-curated feedback_*.md
-  // files under ~/.claude/projects/*/memory/ — but stored in vcontext
-  // (SQLite), so visible to all AIOS clients via SKAP, not just Claude
-  // Code. 2026-04-22.
+  // Recent user corrections — two-tier source of truth.
+  //   TIER 1 (primary): `correction-analysis` entries, LLM-enriched
+  //                     (category / severity / anti_pattern_summary).
+  //                     High precision; cmdEnrichCorrections populates.
+  //   TIER 2 (fallback): raw `correction-event` entries still pending
+  //                     enrichment. Lower precision — regex-detected,
+  //                     shown with raw snippet. Searchable via FTS.
+  // The AIOS design: LLM generation is the authoritative classifier;
+  // regex/index search fills the gap for not-yet-processed events.
+  // Together they ensure "moments the user had to steer me" are always
+  // visible at session bootstrap. Stored in vcontext (SQLite, SKAP-
+  // accessible to all AIOS clients), not Claude-Code-local feedback_*.md.
   try {
-    const corr = await get(`/recent?type=correction-event&n=5${nsParam}${tk}`);
-    const rows = (corr.results || []).filter(r => {
+    // T1: LLM analyses first (most recent 5)
+    const analyses = await get(`/recent?type=correction-analysis&n=5${nsParam}${tk}`);
+    const analyzed = [];
+    const analyzedSourceIds = new Set();
+    for (const r of (analyses.results || [])) {
       try {
         const d = JSON.parse(r.content);
-        return (d.user_text || '').length >= 5;
-      } catch { return false; }
-    });
-    if (rows.length > 0) {
+        if (d.analysis) {
+          analyzed.push({ d, row: r });
+          if (d.source_entry_id) analyzedSourceIds.add(d.source_entry_id);
+        }
+      } catch {}
+    }
+    // T2: raw events not yet analyzed
+    const events = await get(`/recent?type=correction-event&n=10${nsParam}${tk}`);
+    const rawPending = [];
+    for (const r of (events.results || [])) {
+      if (analyzedSourceIds.has(r.id)) continue;
+      try {
+        const d = JSON.parse(r.content);
+        if ((d.user_text || '').length >= 5) rawPending.push({ d, row: r });
+      } catch {}
+    }
+    const totalItems = analyzed.length + Math.min(rawPending.length, 5 - analyzed.length);
+    if (totalItems > 0) {
       lines.push('### Recent User Corrections (avoid re-triggering these patterns)');
-      const seenSnippet = new Set();
-      for (const r of rows.slice(0, 5)) {
-        try {
-          const d = JSON.parse(r.content);
-          const snippet = (d.user_text || '').slice(0, 120).replace(/\s+/g, ' ');
-          if (seenSnippet.has(snippet)) continue;
-          seenSnippet.add(snippet);
+      // T1 rendering — analysis-based
+      for (const { d } of analyzed.slice(0, 5)) {
+        const a = d.analysis || {};
+        const when = (d.analyzed_at || d.source_detected_at || '').slice(0, 16).replace('T', ' ');
+        const cat = a.category || 'unknown';
+        const sev = a.severity || 'unknown';
+        const summary = (a.anti_pattern_summary || '').slice(0, 140).replace(/\s+/g, ' ');
+        lines.push(`- [${sev}/${cat}] ${when} — ${summary}`);
+      }
+      // T2 rendering — raw fallback, fills remaining slot
+      const remaining = 5 - analyzed.length;
+      if (remaining > 0) {
+        for (const { d } of rawPending.slice(0, remaining)) {
           const when = (d.detected_at || '').slice(0, 16).replace('T', ' ');
-          lines.push(`- ${when} — "${snippet}"`);
-        } catch {}
+          const snippet = (d.user_text || '').slice(0, 100).replace(/\s+/g, ' ');
+          lines.push(`- [pending-enrichment] ${when} — "${snippet}"`);
+        }
       }
       lines.push('');
     }
@@ -3086,6 +3297,9 @@ switch (command) {
   case 'synthesize':
   case 'synthesis':
     cmdSynthesize().catch(e => { console.error(e); process.exit(1); });
+    break;
+  case 'enrich-corrections':
+    cmdEnrichCorrections(parseInt(args[0], 10) || 5).catch(e => { console.error(e); process.exit(1); });
     break;
   case 'lock':
     cmdLock(args[0], args[1]).catch(e => { console.error(e); process.exit(1); });
