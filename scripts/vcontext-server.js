@@ -6102,15 +6102,31 @@ function handleAiStatus(req, res) {
   // One aggregate query instead of 6 full-table scans — /ai/status was
   // 1.2s (6 × 200ms COUNT(*) over 40k rows). Single pass with SUM(CASE)
   // cuts it to ~200ms.
+  //
+  // 2026-04-22 fix: previous embedding_backlog = total - embedded
+  // counted SKIP_TYPES (pre-tool, working-state, anomaly-alert,
+  // session-recall, test) which are *never* meant to be embedded, so
+  // backlog was permanently >60k despite zero actual work to drain.
+  // Now split into:
+  //   embedding_backlog_raw      — every row with NULL embedding
+  //   embedding_backlog          — only eligible (rows that SHOULD be embedded)
+  //   embedding_backlog_skipped  — rows intentionally excluded (audit-only types)
+  // The `embedding_backlog` key keeps its name but changes semantics to
+  // match the comment at L6106 (the original intent). Consumers that
+  // want the old value should use embedding_backlog_raw.
   let embeddingCount = 0;
-  let embeddingBacklog = 0;       // 24h-recent eligible rows still missing embedding
-  let embeddingEligibleTotal = 0; // total ELIGIBLE rows (denominator)
+  let embeddingBacklog = 0;          // eligible NULL rows (the meaningful metric)
+  let embeddingBacklogRaw = 0;       // all NULL rows (old semantics, backward-compat)
+  let embeddingBacklogSkipped = 0;   // NULL rows in skip types (pre-tool etc.)
+  let embeddingEligibleTotal = 0;    // total ELIGIBLE rows (denominator)
   let genStats = { summaries: 0, suggestions: 0, skills_created: 0, discoveries: 0 };
   try {
     const agg = dbQuery(`
       SELECT
         COUNT(*) AS total,
         COUNT(embedding) AS embedded,
+        SUM(CASE WHEN embedding IS NULL AND type NOT IN ('working-state','anomaly-alert','pre-tool','session-recall','test') THEN 1 ELSE 0 END) AS eligible_null,
+        SUM(CASE WHEN embedding IS NULL AND type IN ('working-state','anomaly-alert','pre-tool','session-recall','test') THEN 1 ELSE 0 END) AS skipped_null,
         SUM(CASE WHEN reasoning IS NOT NULL AND reasoning != '' THEN 1 ELSE 0 END) AS with_reasoning,
         SUM(CASE WHEN type = 'skill-suggestion' THEN 1 ELSE 0 END) AS skill_suggestions,
         SUM(CASE WHEN type = 'skill-created' THEN 1 ELSE 0 END) AS skill_created,
@@ -6119,7 +6135,9 @@ function handleAiStatus(req, res) {
     `)[0] || {};
     embeddingEligibleTotal = agg.total || 0;
     embeddingCount = agg.embedded || 0;
-    embeddingBacklog = embeddingEligibleTotal - embeddingCount;
+    embeddingBacklogRaw = embeddingEligibleTotal - embeddingCount;
+    embeddingBacklog = agg.eligible_null || 0;
+    embeddingBacklogSkipped = agg.skipped_null || 0;
     genStats = {
       summaries: agg.with_reasoning || 0,
       suggestions: agg.skill_suggestions || 0,
@@ -6139,7 +6157,9 @@ function handleAiStatus(req, res) {
     mlx_dim: mlxEmbedDim,
     embedding_count: embeddingCount,
     embedding_eligible_total: embeddingEligibleTotal,
-    embedding_backlog: embeddingBacklog,
+    embedding_backlog: embeddingBacklog,             // eligible only (fixed 2026-04-22)
+    embedding_backlog_raw: embeddingBacklogRaw,      // all NULL (backward-compat)
+    embedding_backlog_skipped: embeddingBacklogSkipped, // intentional-skip types
     preferred: {
       summarize: mlxGenerateAvailable ? MLX_GENERATE_MODEL : null,
       embed: mlxAvailable ? `${mlxModelName} (mlx)` : null,
