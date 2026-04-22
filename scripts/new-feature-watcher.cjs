@@ -381,6 +381,14 @@ async function saveCheckpoint(registered = 0, candidates = 0) {
 }
 
 main().catch(err => {
+  // Graceful skip: both LLMs unavailable is expected when mlx-generate is
+  // launchctl-disabled and no ANTHROPIC_API_KEY is configured. Exit 0 so
+  // launchd's Check #8 doesn't flag this as a failure — the user has opted
+  // out of daily feature watching rather than encountered a bug.
+  if (/ANTHROPIC_API_KEY not set/.test(err.message)) {
+    console.log('[watcher] Skipped — MLX generate disabled and no ANTHROPIC_API_KEY configured. Enable mlx-generate or set the API key to reactivate.');
+    process.exit(0);
+  }
   console.error('[watcher] FATAL:', err.message);
   process.exit(1);
 });
