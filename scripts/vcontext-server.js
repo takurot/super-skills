@@ -4236,6 +4236,27 @@ const ANOMALY_COOLDOWN_MS = 5 * 60 * 1000; // 5 min
 function respondToAnomalies(alerts) {
   const now = Date.now();
   const actions = [];
+  // Helper: emit a `skill-trigger` entry so infinite-skills routing picks
+  // up this anomaly on the NEXT session (reactive skill invocation).
+  // Added 2026-04-22 after the alert→skill wiring audit identified 9 of
+  // 13 alert sites had no downstream response — most merely logged. The
+  // skill-trigger entry type is already consumed by the discovery loop
+  // (scripts/vcontext-server.js:4843 generator, but was passive-only
+  // before). With this helper, anomalies reactively push keywords that
+  // surface in the NEXT infinite-skills match, giving the AI a chance
+  // to apply `investigate` / `careful` / etc. without user intervention.
+  const emitSkillTrigger = (kind, keywords, rationale) => {
+    try {
+      const payload = JSON.stringify({
+        keywords,
+        for_skills: ['infinite-skills'],
+        anomaly_kind: kind,
+        rationale: String(rationale || '').slice(0, 300),
+        generated_at: new Date().toISOString(),
+      });
+      dbExec(`INSERT INTO entries (type, content, tags, session, token_estimate, last_accessed, access_count, tier) VALUES ('skill-trigger', ${esc(payload)}, '["skill-trigger","anomaly-reactive","auto"]', 'system', ${estimateTokens(payload)}, datetime('now'), 0, 'ram');`);
+    } catch {}
+  };
   for (const alert of alerts) {
     const msg = alert.msg || '';
     // Key = anomaly kind (not the full message, which includes varying counts)
@@ -4244,6 +4265,12 @@ function respondToAnomalies(alerts) {
     else if (msg.startsWith('Embedding stalled')) kind = 'embed-stall';
     else if (msg.startsWith('RAM ahead of SSD')) kind = 'ram-ahead';
     else if (msg.startsWith('RAM disk >3GB')) kind = 'ram-disk-full';
+    else if (msg.startsWith('Latency regression')) kind = 'latency-regression';
+    else if (msg.startsWith('DB errors in recent log')) kind = 'db-errors';
+    else if (msg.startsWith('Embed backlog growing')) kind = 'backlog-growing';
+    else if (msg.startsWith('doBackupAndMigrate slow')) kind = 'backup-slow';
+    else if (msg.startsWith('Tick interval jitter')) kind = 'tick-jitter';
+    else if (msg.startsWith('MLX embed p95 regression')) kind = 'mlx-p95-regression';
     if (!kind) continue;
 
     const last = _anomalyLastAction.get(kind) || 0;
@@ -4270,9 +4297,45 @@ function respondToAnomalies(alerts) {
         try { execSync(`osascript -e 'display notification "${msg.replace(/"/g, "")}" with title "🚨 vcontext RAM full"' 2>/dev/null || true`); } catch {}
         console.log('[anomaly-response] RAM disk full — checkpointed + migrated');
       } else if (kind === 'error-spike') {
-        // Humans only — spike could be any bug. Notify.
+        // Humans only — spike could be any bug. Notify + emit skill-trigger.
         try { execSync(`osascript -e 'display notification "${msg.replace(/"/g, "")}" with title "⚠️ vcontext errors"' 2>/dev/null || true`); } catch {}
-        actions.push({ kind, action: 'macOS notification (no auto-fix — needs diagnosis)' });
+        emitSkillTrigger(kind, ['error-spike', 'investigate', 'careful'], msg);
+        actions.push({ kind, action: 'macOS notification + skill-trigger (investigate)' });
+      } else if (kind === 'latency-regression') {
+        // Op-specific latency regression (>=3x baseline). Emit skill-trigger
+        // so next session applies `investigate`; no auto-fix — root cause varies.
+        emitSkillTrigger(kind, ['latency-regression', 'performance', 'investigate'], msg);
+        actions.push({ kind, action: 'skill-trigger emitted (investigate — latency regression)' });
+        console.log(`[anomaly-response] latency regression — emitted skill-trigger: ${msg.slice(0, 80)}`);
+      } else if (kind === 'db-errors') {
+        // DB errors in log (corruption / schema drift). Critical → notify + skill-trigger.
+        try { execSync(`osascript -e 'display notification "${msg.replace(/"/g, "").slice(0, 100)}" with title "🚨 vcontext DB errors"' 2>/dev/null || true`); } catch {}
+        emitSkillTrigger(kind, ['db-errors', 'sqlite-corruption', 'investigate', 'careful'], msg);
+        actions.push({ kind, action: 'notification + skill-trigger (investigate, careful)' });
+        console.log(`[anomaly-response] DB errors spike — notification + skill-trigger emitted`);
+      } else if (kind === 'backlog-growing') {
+        // Producer/consumer imbalance (user writes faster than MLX embeds).
+        // Known: the fresh-first LIMIT 16 DESC SELECT starves old rows —
+        // fairness fix is deferred code change; for now emit skill-trigger
+        // so next session picks up `investigate` + proposes aging scheduler.
+        emitSkillTrigger(kind, ['embed-backlog', 'fairness', 'aging-scheduler', 'investigate'], msg);
+        actions.push({ kind, action: 'skill-trigger (investigate — backlog fairness)' });
+        console.log(`[anomaly-response] embed backlog growing — emitted skill-trigger: ${msg.slice(0, 80)}`);
+      } else if (kind === 'backup-slow') {
+        // doBackupAndMigrate saturating the 5min scheduler budget.
+        emitSkillTrigger(kind, ['backup-scheduler', 'saturation', 'investigate'], msg);
+        actions.push({ kind, action: 'skill-trigger (investigate — backup saturation)' });
+        console.log(`[anomaly-response] backup slow streak — emitted skill-trigger`);
+      } else if (kind === 'tick-jitter') {
+        // Event loop blocking; low-urgency under load, but track.
+        emitSkillTrigger(kind, ['event-loop-blocked', 'jitter', 'investigate'], msg);
+        actions.push({ kind, action: 'skill-trigger (investigate — event loop)' });
+        console.log(`[anomaly-response] tick jitter — emitted skill-trigger`);
+      } else if (kind === 'mlx-p95-regression') {
+        // MLX embed p95 > 5× 24h baseline. Likely tail-latency drift.
+        emitSkillTrigger(kind, ['mlx-embed', 'p95-regression', 'investigate'], msg);
+        actions.push({ kind, action: 'skill-trigger (investigate — mlx p95)' });
+        console.log(`[anomaly-response] MLX p95 regression — emitted skill-trigger: ${msg.slice(0, 80)}`);
       }
     } catch (e) {
       console.error(`[anomaly-response] ${kind} failed:`, e.message?.slice(0, 80));
