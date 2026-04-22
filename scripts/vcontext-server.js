@@ -1,4 +1,21 @@
 #!/usr/bin/env node
+
+// ── Timestamp every console.* line ────────────────────────────────
+// Prepends ISO-8601 UTC before the existing "[tag]" prefix so grep
+// patterns on tags (e.g. `grep '[mlx-keepalive]'`) still match while
+// giving /tmp/vcontext-server.log the timeline information needed to
+// distinguish pre-cutover vs post-cutover events. Added 2026-04-22
+// after a post-cutover incident where untimestamped lines made it
+// impossible to decide which ECONNREFUSED entries were cutover-caused
+// vs pre-existing. Applies on next restart only — no hot-reload.
+{
+  const _log = console.log, _warn = console.warn, _err = console.error;
+  const ts = () => new Date().toISOString();
+  console.log   = (...a) => _log(ts(), ...a);
+  console.warn  = (...a) => _warn(ts(), ...a);
+  console.error = (...a) => _err(ts(), ...a);
+}
+
 /**
  * vcontext-server.js — Virtual Context REST API
  *
