@@ -1,0 +1,37 @@
+#!/bin/bash
+# MLXEmbedServerStandalone — runs the Python standalone server under the .app
+# bundle so macOS Launch Services assigns jetsam category=app (priority 100).
+#
+# Why this wrapper (not a direct plist Program): LaunchAgent plists that run
+# a binary directly inherit cat=daemon, priority=40 from launchd. Wrapping in
+# an .app bundle + launching via `open -W -n -a` routes through LaunchServices
+# / runningboardd, which assigns cat=app, priority=100 to the .app process.
+# See docs/handoff/2026-04-22-mlx-standalone-rollback.md for empirical
+# measurements (prod=40 vs new=100).
+#
+# Logging: open -W does NOT forward child stdout/stderr to launchd's
+# StandardOutPath. We redirect ourselves to /tmp/mlx-embed-server-standalone.log
+# (parity with production's /tmp/mlx-embed-server.log observability path).
+# Empirically confirmed 2026-04-22: without this, log was 0 bytes despite
+# traffic; with this, uvicorn access log + Python prints are captured.
+#
+# CWD: set to ~/skills to match production behavior (relative paths, caches).
+#
+# CPU nice: runningboardd does NOT inherit the plist Nice=-20 for .app
+# children. Non-root users cannot lower nice below 0. Accepted regression
+# (prod was nice=-20, new is 0). Jetsam uplift 40→100 is the primary
+# stability gain; MLX latency is dominated by GPU+memory, not CPU contention.
+
+PYTHON_BIN="${PYTHON_BIN:-/Users/mitsuru_nakajima/.pyenv/versions/3.13.2/bin/python3}"
+SERVER_PY="${SERVER_PY:-/Users/mitsuru_nakajima/skills/scripts/mlx-embed-server-standalone.py}"
+LOG_PATH="${LOG_PATH:-/tmp/mlx-embed-server-standalone.log}"
+
+cd /Users/mitsuru_nakajima/skills || exit 1
+
+# Simple rotation: if log > 10MB, keep previous run as .prev
+if [ -f "$LOG_PATH" ] && [ $(stat -f%z "$LOG_PATH" 2>/dev/null || echo 0) -gt 10485760 ]; then
+  mv "$LOG_PATH" "${LOG_PATH}.prev" 2>/dev/null || true
+fi
+
+echo "=== MLXEmbedServerStandalone start $(date) args=$* ===" >> "$LOG_PATH"
+exec "$PYTHON_BIN" -u "$SERVER_PY" "$@" >> "$LOG_PATH" 2>&1
