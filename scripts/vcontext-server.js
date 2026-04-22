@@ -4104,7 +4104,23 @@ function detectAnomalies() {
       fs.readSync(fd, buf, 0, scanBytes, stat.size - scanBytes);
       fs.closeSync(fd);
       const text = buf.toString('utf8');
-      const errors = (text.match(/\[db exec error|\[db query error|database disk image is malformed/g) || []).length;
+      // 2026-04-22: gate on server-start time. Log lines from BEFORE the
+      // current process started (e.g., pre-restart corruption errors) must
+      // not count against the "live" 30-min window — the old detector
+      // re-scanned stale content on every tick and fired false positives
+      // after a clean restart. Now: only count lines whose ISO-8601
+      // timestamp (added by the console.* patch in commit bd4cdeb) is >=
+      // this process's start time.
+      const errorRe = /\[db exec error|\[db query error|database disk image is malformed/;
+      const tsRe = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)\s/;
+      const startIso = (_processStartIso ||= new Date(Date.now() - (process.uptime() * 1000)).toISOString());
+      let errors = 0;
+      for (const line of text.split('\n')) {
+        const m = tsRe.exec(line);
+        if (!m) continue;              // pre-timestamp era or [wrapper] lines: skip
+        if (m[1] < startIso) continue; // older than current boot: skip
+        if (errorRe.test(line)) errors++;
+      }
       if (errors > 20) {
         alerts.push({ level: 'high', msg: `DB errors in recent log: ${errors} (last ~30min) — check for corruption or schema drift` });
       }
@@ -4235,6 +4251,10 @@ function detectAnomalies() {
 
 // Track last-action timestamps per anomaly kind to avoid flapping
 const _anomalyLastAction = new Map();
+// Cached ISO-8601 of this process's start time (lazy-init). Used by the
+// db-errors detector to skip log lines from prior process runs. See
+// 2026-04-22 commit touching detectAnomalies' log-scan branch.
+let _processStartIso;
 const ANOMALY_COOLDOWN_MS = 5 * 60 * 1000; // 5 min
 
 function respondToAnomalies(alerts) {

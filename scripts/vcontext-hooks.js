@@ -1989,9 +1989,15 @@ async function handleSessionRecall() {
     });
     if (triggers.length > 0) {
       lines.push('### Recent Anomaly Skill-Triggers (from earlier sessions)');
+      // Dedup by anomaly_kind — same kind recurring 5× shouldn't render 5
+      // identical lines. Mirrors the Continuation Candidates pattern
+      // (seen Set at L2039). M4 review found this 2026-04-22.
+      const seenKinds = new Set();
       for (const r of triggers.slice(0, 5)) {
         try {
           const d = JSON.parse(r.content);
+          if (seenKinds.has(d.anomaly_kind)) continue;
+          seenKinds.add(d.anomaly_kind);
           const when = (d.generated_at || '').slice(0, 19).replace('T', ' ');
           const kw = (d.keywords || []).slice(0, 4).join(', ');
           const rationale = (d.rationale || '').slice(0, 80).replace(/\s+/g, ' ');
