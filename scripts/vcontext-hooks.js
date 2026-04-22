@@ -1818,6 +1818,48 @@ async function handleUserPrompt() {
       session: sessionId,
     }).catch(() => {});
   }
+
+  // 6. Correction-event detection. Pattern-based classifier that looks
+  // for phrasing typical of user pushing back / correcting / calling
+  // out a miss. The goal is to accumulate a searchable record of
+  // "moments the user had to steer me" so:
+  //   - session-recall can surface recent corrections at bootstrap
+  //   - later M2/M3 enforcement can pre-empt repeating patterns
+  // False-positive tolerant by design — better to capture noise than
+  // miss signal (the feedback_*.md files today are hand-curated; this
+  // hook replaces the manual capture with auto-log). Added 2026-04-22.
+  const correctionPatterns = [
+    /違う|違います|そうじゃ(?:なくて|ない)|そうでなく/,
+    /おかしい|変(?:だ|です|だよ|じゃない)/,
+    /なんで|どうして.{0,10}?(?:しない|ない)/,
+    /先延ばし|サボ|怠/,
+    /理解できない|さっぱり/,
+    /判断.{0,15}(?:材料|理由).{0,10}少な/,
+    /期待.{0,10}(?:してる|する).{0,20}(?:と違|じゃない)/,
+    /\bwrong\b|\bincorrect\b|\bnot what\b/i,
+    /why (?:didn't|aren't|don't|haven't)/i,
+    /instead of|rather than/i,
+  ];
+  const matchedCorrection = correctionPatterns.filter(p => p.test(prompt));
+  if (matchedCorrection.length > 0 && prompt.length >= 5) {
+    let priorAssistant = '';
+    try {
+      const r = await get(`/session/${encodeURIComponent(sessionId)}?type=assistant-response&limit=1`);
+      if (r.results?.[0]) priorAssistant = String(r.results[0].content).slice(0, 600);
+    } catch {}
+    post('/store', {
+      type: 'correction-event',
+      content: JSON.stringify({
+        session: sessionId,
+        user_text: prompt.slice(0, 800),
+        prior_assistant: priorAssistant,
+        matched_patterns: matchedCorrection.map(p => p.source),
+        detected_at: new Date().toISOString(),
+      }),
+      tags: ['correction-event', 'auto'],
+      session: sessionId,
+    }).catch(() => {});
+  }
 }
 
 async function handleSubagentStart(eventName = 'subagent-start') {
@@ -2002,6 +2044,38 @@ async function handleSessionRecall() {
           const kw = (d.keywords || []).slice(0, 4).join(', ');
           const rationale = (d.rationale || '').slice(0, 80).replace(/\s+/g, ' ');
           lines.push(`- [${d.anomaly_kind}] ${when} — keywords: ${kw}${rationale ? ' — ' + rationale : ''}`);
+        } catch {}
+      }
+      lines.push('');
+    }
+  } catch { /* non-fatal */ }
+
+  // Recent user corrections — written by handleUserPrompt when pattern
+  // matchers fire. Surfaces "moments the user had to steer me" so the
+  // AI sees them at session bootstrap and can avoid re-triggering the
+  // same patterns. Complements the manually-curated feedback_*.md
+  // files under ~/.claude/projects/*/memory/ — but stored in vcontext
+  // (SQLite), so visible to all AIOS clients via SKAP, not just Claude
+  // Code. 2026-04-22.
+  try {
+    const corr = await get(`/recent?type=correction-event&n=5${nsParam}${tk}`);
+    const rows = (corr.results || []).filter(r => {
+      try {
+        const d = JSON.parse(r.content);
+        return (d.user_text || '').length >= 5;
+      } catch { return false; }
+    });
+    if (rows.length > 0) {
+      lines.push('### Recent User Corrections (avoid re-triggering these patterns)');
+      const seenSnippet = new Set();
+      for (const r of rows.slice(0, 5)) {
+        try {
+          const d = JSON.parse(r.content);
+          const snippet = (d.user_text || '').slice(0, 120).replace(/\s+/g, ' ');
+          if (seenSnippet.has(snippet)) continue;
+          seenSnippet.add(snippet);
+          const when = (d.detected_at || '').slice(0, 16).replace('T', ' ');
+          lines.push(`- ${when} — "${snippet}"`);
         } catch {}
       }
       lines.push('');
