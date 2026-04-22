@@ -405,6 +405,15 @@ async function saveCheckpoint(registered, candidates) {
 }
 
 main().catch(err => {
+  // Graceful skip: both LLMs unavailable is expected when mlx-generate is
+  // launchctl-disabled and no ANTHROPIC_API_KEY is configured. Exit 0 so
+  // launchd's Check #8 doesn't flag this as a failure — the user has opted
+  // out of daily skill mining rather than encountered a bug.
+  // (Same A-alt template as new-feature-watcher.cjs — commit 5f6ed4a.)
+  if (/ANTHROPIC_API_KEY not set/.test(err.message)) {
+    console.log('[miner] Skipped — MLX generate disabled and no ANTHROPIC_API_KEY configured. Enable mlx-generate or set the API key to reactivate.');
+    process.exit(0);
+  }
   console.error('[miner] FATAL:', err.message);
   process.exit(1);
 });
