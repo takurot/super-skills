@@ -4169,6 +4169,10 @@ function detectAnomalies() {
             dbExec(`INSERT INTO entries (type, content, tags, session, token_estimate, last_accessed, access_count, tier) VALUES ('anomaly-alert', ${esc(content)}, '["anomaly-alert","auto","launchd"]', 'system', ${estimateTokens(content)}, datetime('now'), 0, 'ram');`);
             console.log(`[vcontext:alert] launchd ${dead.length} service(s) unhealthy: ${shown}${suffix}`);
           } catch {}
+          // Route through respondToAnomalies so cooldown + skill-trigger
+          // emission happen even though this path is async-separated from
+          // the main detectAnomalies flow. 2026-04-22 wiring fix.
+          try { respondToAnomalies([{ level: 'medium', msg }]); } catch (e) { console.error('[anomaly-response]', e.message?.slice(0, 80)); }
         }).catch(() => { /* launchctl missing / timeout / parse error — silent skip */ });
       }
     }
@@ -4271,6 +4275,7 @@ function respondToAnomalies(alerts) {
     else if (msg.startsWith('doBackupAndMigrate slow')) kind = 'backup-slow';
     else if (msg.startsWith('Tick interval jitter')) kind = 'tick-jitter';
     else if (msg.startsWith('MLX embed p95 regression')) kind = 'mlx-p95-regression';
+    else if (msg.startsWith('LaunchAgent failures')) kind = 'launchd-unhealthy';
     if (!kind) continue;
 
     const last = _anomalyLastAction.get(kind) || 0;
@@ -4336,6 +4341,14 @@ function respondToAnomalies(alerts) {
         emitSkillTrigger(kind, ['mlx-embed', 'p95-regression', 'investigate'], msg);
         actions.push({ kind, action: 'skill-trigger (investigate — mlx p95)' });
         console.log(`[anomaly-response] MLX p95 regression — emitted skill-trigger: ${msg.slice(0, 80)}`);
+      } else if (kind === 'launchd-unhealthy') {
+        // Dead LaunchAgents found via the async probe. Auto-restart is
+        // risky (why did they die?) → route to human via notification +
+        // emit skill-trigger so the next session picks up investigate.
+        try { execSync(`osascript -e 'display notification "${msg.replace(/"/g, "").slice(0, 100)}" with title "⚠️ vcontext LaunchAgent failures"' 2>/dev/null || true`); } catch {}
+        emitSkillTrigger(kind, ['launchd-unhealthy', 'launch-agent', 'investigate'], msg);
+        actions.push({ kind, action: 'notification + skill-trigger (investigate — launch agents)' });
+        console.log(`[anomaly-response] LaunchAgent failures — notification + skill-trigger emitted`);
       }
     } catch (e) {
       console.error(`[anomaly-response] ${kind} failed:`, e.message?.slice(0, 80));
