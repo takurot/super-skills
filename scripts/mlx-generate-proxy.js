@@ -205,6 +205,87 @@ async function waitForMlxHealth(deadlineMs) {
   return null; // timed out
 }
 
+// S1 (2026-04-23): post-spawn JIT warmup. /health returning 2xx means the
+// process is bound, but Metal shader JIT and attention-layer compile only
+// happen on actual inference. Empirical (R1-8 load test): first user-
+// facing request after :3162 /health ready takes 22-86 s (staged JIT);
+// by request 5, steady-state drops to ~4 s. Running 3 tiny dummy inferences
+// internally before marking RUNNING amortizes the JIT cost out of the
+// user's critical path, so their first real request lands on warm GPU.
+//
+// Disable: VCTX_MLX_WARMUP_DUMMY=0. Default: 3 dummy requests.
+// Budget: each dummy ~15-30 s during first bootstrap; later re-warmups
+// (after cache-eviction M2) are cheaper (~5 s).
+const WARMUP_DUMMY_N = parseInt(process.env.VCTX_MLX_WARMUP_DUMMY || '3', 10);
+
+async function dummyInferenceOnce() {
+  // Fetch the model name from /v1/models rather than hardcoding — lets the
+  // warmup work regardless of the wrapper's MLX_GENERATE_MODEL env. Model
+  // name is required by mlx_lm.server.
+  let modelName = null;
+  try {
+    modelName = await new Promise((resolve) => {
+      const req = http.request({
+        host: MLX_HOST, port: MLX_PORT, path: '/v1/models',
+        method: 'GET', timeout: 5000,
+      }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks).toString());
+            resolve(body?.data?.[0]?.id || null);
+          } catch { resolve(null); }
+        });
+      });
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => { req.destroy(); resolve(null); });
+      req.end();
+    });
+  } catch { return false; }
+  if (!modelName) return false;
+
+  const body = JSON.stringify({
+    model: modelName,
+    messages: [{ role: 'user', content: 'ok' }],
+    max_tokens: 1,
+    temperature: 0,
+  });
+  return new Promise((resolve) => {
+    const req = http.request({
+      host: MLX_HOST, port: MLX_PORT, path: '/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+      timeout: 120 * 1000, // allow up to 2 min per dummy (cold JIT)
+    }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode >= 200 && res.statusCode < 300));
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end(body);
+  });
+}
+
+async function warmupDummyRequests(n) {
+  if (n <= 0) return { ran: 0, ms: 0 };
+  const start = Date.now();
+  let ran = 0;
+  for (let i = 0; i < n; i++) {
+    const ok = await dummyInferenceOnce();
+    if (!ok) {
+      logLine(`warmup dummy ${i + 1}/${n} failed — continuing`);
+      continue; // a failed dummy shouldn't block RUNNING
+    }
+    ran++;
+  }
+  const ms = Date.now() - start;
+  return { ran, ms };
+}
+
 async function startMlx() {
   // Fast path: already running.
   if (state.value === 'RUNNING') return;
@@ -279,16 +360,26 @@ async function startMlx() {
       throw err;
     }
 
+    // S1 (2026-04-23): JIT warmup before marking RUNNING. Moves the
+    // ~60-80 s staged JIT cost off the user's first real request. The
+    // dummy inferences run against the backend's /v1/chat/completions
+    // with max_tokens=1, so they exercise the same codepath as real
+    // requests but are cheap per call after the first.
+    let dummy = { ran: 0, ms: 0 };
+    if (WARMUP_DUMMY_N > 0) {
+      dummy = await warmupDummyRequests(WARMUP_DUMMY_N);
+    }
+
     state.value = 'RUNNING';
-    state.warm_up_ms_last = warmupMs;
+    state.warm_up_ms_last = warmupMs + dummy.ms;
     // M2: fresh process = fresh cache. Reset counter.
     state.requests_since_bootstrap = 0;
-    state.metrics.warmup_latencies_ms.push(warmupMs);
+    state.metrics.warmup_latencies_ms.push(warmupMs + dummy.ms);
     // Keep the latencies array bounded
     if (state.metrics.warmup_latencies_ms.length > 100) {
       state.metrics.warmup_latencies_ms.shift();
     }
-    logLine(`MLX RUNNING after ${warmupMs}ms warm-up (cache reset)`);
+    logLine(`MLX RUNNING after ${warmupMs}ms health + ${dummy.ms}ms dummy-warmup (${dummy.ran}/${WARMUP_DUMMY_N} ran, cache reset)`);
   })();
 
   state.starting_promise = p;
@@ -428,13 +519,47 @@ function handleProxyMetrics(req, res) {
 
 // ── Main request handler ─────────────────────────────────────────
 
+// S1 (2026-04-23): externally-triggerable pre-warmup. Lets a scheduled
+// LaunchAgent (Calendar-trigger) or a user-session hook pre-warm the
+// backend out-of-band, so the subsequent on-demand user request lands
+// on already-compiled GPU state. If MLX is STOPPED, runs the full
+// bootstrap+dummy warmup flow. If RUNNING, re-runs dummy inferences
+// (cheap re-warm after cache eviction).
+async function handleProxyWarmup(req, res) {
+  const start = Date.now();
+  try {
+    if (state.value !== 'RUNNING') {
+      await startMlx(); // includes warmupDummyRequests internally
+    } else {
+      // Already RUNNING — run extra dummies to refresh KV / JIT state.
+      const extra = await warmupDummyRequests(Math.max(1, WARMUP_DUMMY_N - 1));
+      state.metrics.warmup_latencies_ms.push(extra.ms);
+      if (state.metrics.warmup_latencies_ms.length > 100) {
+        state.metrics.warmup_latencies_ms.shift();
+      }
+    }
+    replyJson(res, 200, {
+      ok: true,
+      state: state.value,
+      total_ms: Date.now() - start,
+      warm_up_ms_last: state.warm_up_ms_last,
+      dummy_n: WARMUP_DUMMY_N,
+    });
+  } catch (e) {
+    const st = e.status || 503;
+    replyJson(res, st, { ok: false, error: e.message, total_ms: Date.now() - start });
+  }
+}
+
 async function handleRequest(req, res) {
   const url = req.url || '/';
 
-  // Proxy-internal endpoints never trigger MLX
+  // Proxy-internal endpoints never trigger MLX (except /proxy/warmup
+  // which explicitly requests one).
   if (url === '/proxy/health')  return handleProxyHealth(req, res);
   if (url === '/proxy/state')   return handleProxyState(req, res);
   if (url === '/proxy/metrics') return handleProxyMetrics(req, res);
+  if (url === '/proxy/warmup' && req.method === 'POST') return handleProxyWarmup(req, res);
 
   // Everything else: lazy-load + forward
   state.last_request_at = Date.now();
