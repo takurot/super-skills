@@ -170,13 +170,16 @@ const DB_PATH = '/Users/mitsuru_nakajima/skills/data/vcontext-primary.sqlite';
 
 function sqliteFetchOne() {
   try {
-    // Newest-first so recent entries get annotated first. Read-only, no
-    // lock contention worry → no busy_timeout PRAGMA needed. (Bug fix:
-    // previously a `-cmd 'PRAGMA busy_timeout = 500;'` was contaminating
-    // stdout with '500' on its own line, which parseInt grabbed before
-    // reaching the actual row.)
-    // Exclude `reprocess-progress` (our own progress entries — would
-    // create a self-feedback loop processing our own logs).
+    // Read-only — no PRAGMA busy_timeout needed.
+    // Exclude `reprocess-progress` (our own progress entries — self-
+    // feedback loop guard).
+    // Bug fix 2026-04-23: earlier SOH-separator parsing broke on entries
+    // whose `content` contained literal \n characters (most of them —
+    // user-prompt, assistant-response, tool-use all multi-line). The
+    // `split('\n')` defensive-last-line logic grabbed only a fragment,
+    // failed parts-count guard, and returned null — causing the script
+    // to exit with "drained" after only 4 entries (the handful without
+    // newlines). `-json` mode handles every escape correctly.
     const sql =
       "SELECT id, type, substr(content, 1, 2000) as content " +
       "FROM entries " +
@@ -185,20 +188,18 @@ function sqliteFetchOne() {
       "  AND LENGTH(content) >= 50 " +
       "  AND type != 'reprocess-progress' " +
       "ORDER BY created_at DESC LIMIT 1;";
-    const out = execFileSync('sqlite3', ['-separator', '\u0001', DB_PATH, sql], {
+    const out = execFileSync('sqlite3', ['-json', DB_PATH, sql], {
       timeout: 10000,
-      maxBuffer: 10 * 1024 * 1024,
+      maxBuffer: 20 * 1024 * 1024,
     }).toString().trim();
     if (!out) return null;
-    // Take the last non-empty line (defensive — any stray output before
-    // won't poison the parse).
-    const lines = out.split('\n').filter(Boolean);
-    const line = lines[lines.length - 1];
-    const parts = line.split('\u0001');
-    if (parts.length < 3) return null;
-    const id = parseInt(parts[0], 10);
+    let rows;
+    try { rows = JSON.parse(out); } catch { return null; }
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const r = rows[0];
+    const id = parseInt(r.id, 10);
     if (!Number.isFinite(id)) return null;
-    return { id, type: parts[1], content: parts.slice(2).join('\u0001') };
+    return { id, type: String(r.type || ''), content: String(r.content || '') };
   } catch (e) {
     // Lock contention is non-fatal — caller will retry on next iter.
     return null;
