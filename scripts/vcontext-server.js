@@ -5872,6 +5872,17 @@ async function mlxEmbedFast(text, timeoutMs = 2000) {
     _queryEmbedCache.set(key, cached);
     return cached;
   }
+  // C11 D8 (2026-04-23 P0c scope-down): respect the module-level
+  // circuit breaker. Without this, /search/semantic absorbs a full 2s
+  // timeout per request during an MLX outage AND keeps nudging the
+  // MLX server (whose retry budget is already exhausted by the batch
+  // loop). Mirrors the gate on mlxEmbed's keep-alive path at L5762.
+  // Net effect under open circuit: recall returns null instantly and
+  // /search/semantic falls through to FTS — identical semantics as
+  // the catch-returns-null failure path, but ~2s faster per request.
+  if (typeof _isEmbedCircuitOpen === 'function' && _isEmbedCircuitOpen()) {
+    return null;
+  }
   try {
     // Bypass withMlxLock — the MLX embed HTTP server handles its own
     // queueing, and the app-level lock serializes with batch embedding
