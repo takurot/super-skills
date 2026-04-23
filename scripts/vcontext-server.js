@@ -1633,7 +1633,15 @@ async function handleStore(req, res) {
           vecUpsert(entry.id, embedding);
           try { dbExec(`UPDATE entry_index SET has_embedding = 1 WHERE entry_id = ${entry.id};`); } catch {}
         }
-      } catch {} // Non-fatal
+      } catch (e) {
+        // 2026-04-23 silent-catch fix (Tier C, top-1 from incompleteness
+        // audit). Previously this catch swallowed writeEmbeddingBlob /
+        // vecUpsert failures silently — masking the mechanism behind the
+        // 60k "backlog" phantom and 174 ECONNREFUSED retry behavior. Now
+        // logs the failure with entry_id + error class for correlation.
+        // Still non-fatal (store() should not crash on index-side failure).
+        console.error(`[store] embedding persistence failed entry_id=${entry.id}: ${(e?.message || e || 'unknown').toString().slice(0, 200)}`);
+      }
     });
   }
 
