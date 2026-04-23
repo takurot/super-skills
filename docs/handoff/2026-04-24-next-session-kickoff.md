@@ -1,12 +1,16 @@
 # Next-Session Kickoff — 2026-04-24
 
-*Session 2026-04-23 (afternoon → evening, ~6h). 8 commits shipped.
-Core: SIGKILL-137 cadence break, M2 phase-1 shadow deploy, silent-
-catch top-5 cleanup, P0c circuit-breaker gap closed. Major outcomes:
-SIGKILL-137 0 kills in 60+ min (prior cadence ~4h), sys_free floor
-66x improvement, jetsam pri 40→100 cutover, watchdog observability
-live, evidence-gate shadow running log-only, mlxEmbedFast now gated
-by C11 breaker (no more 2s timeouts during MLX outage).*
+*Session 2026-04-23 (afternoon → evening, ~7h). 11 commits shipped.
+Core: SIGKILL-137 cadence break, M2 phase-1 shadow + M5 retrospective
+deploy, silent-catch top-5 cleanup, P0c circuit-breaker gap closed,
+observability automation (15min probe + daily LLM-jp-4 watch),
+mlx-generate re-enable empirically verified (Qwen3-8B-4bit live on
+:3162 with 12s warm-up, JP + EN prompts OK, no swap cascade). Major
+outcomes: SIGKILL-137 0 kills in 90+ min (prior cadence ~4h), sys_free
+floor 66x improvement, jetsam pri 40→100 cutover, watchdog
+observability live, evidence-gate shadow running log-only, M5 compounds
+daily from next session onward, observation probe fires every 15min
+and writes to vcontext unattended.*
 
 ---
 
@@ -36,9 +40,12 @@ sysctl -n vm.swapusage
 
 ---
 
-## Today's 8 commits (2026-04-23)
+## Today's 11 commits (2026-04-23)
 
 ```
+086734a  feat(hooks): M5 session-end retrospective (log-only, daily-compounding)
+adde5b2  feat(observability): 15min probe + daily LLM-jp-4 research watch
+d063123  docs(handoff): update 2026-04-24 kickoff with full 8-commit day
 80ce3e3  fix(embed): P0c — mlxEmbedFast respects circuit breaker (C11 D8)
 6bbf496  fix(silent-catches): top-5 from 2026-04-22 audit — 4 of 5 (top-1 landed eda4a95)
 90c4871  docs: P0a plist runbook + 2026-04-24 kickoff handoff
@@ -49,7 +56,32 @@ a069e0f  feat(vcontext): P0a cat=app migration — jetsam pri 40→100
 441fb8c  feat(vcontext): P0d 15s watchdog for RSS/heap/swap observability
 ```
 
-(Plus today's earlier commit `eda03b4` fix(article-scanner): A-alt graceful skip.)
+(Plus earlier commit `eda03b4` fix(article-scanner): A-alt graceful skip.
+**12 commits total today.**)
+
+## New LaunchAgents loaded today (outside repo)
+
+```
+~/Library/LaunchAgents/com.vcontext.observation-probe.plist    (15min interval, RunAtLoad)
+~/Library/LaunchAgents/com.vcontext.llm-jp-4-watch.plist       (daily 9:00 JST, Calendar)
+```
+
+Both loaded via `launchctl bootstrap gui/$(id -u) <plist>` at 2026-04-23.
+Disable: `launchctl bootout gui/$(id -u)/<label>` + move plist to `.disabled`.
+
+## mlx-generate re-enable: ✅ VERIFIED (2026-04-23 12:21 JST)
+
+Empirical test succeeded: Qwen3-8B-4bit live on :3162 via
+mlx-generate-proxy :3163. 12s cold warmup, then ~3s per request.
+Tested EN (`ping`) + JP (`日本の首都は?`) prompts — both returned
+valid completions. No swap cascade (swap stayed at 7.8GB during
+warmup). Original gate "swap < 4GB" de-facto obsolete post-P0abd:
+pressure-per-headroom ratio is now safe enough to run continuously.
+
+Note: vcontext `/health` still shows `mlx_generate_available=False`
+until vcontext's next MLX probe cycle detects the live backend — this
+is a probe-timing artifact, not a functional issue. Next session
+should confirm `/health` catches up (~10 min interval typically).
 
 ---
 
