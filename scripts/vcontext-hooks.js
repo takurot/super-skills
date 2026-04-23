@@ -52,7 +52,15 @@ function errorLog(kind, detail) {
   try {
     const line = JSON.stringify({ at: new Date().toISOString(), kind, detail }) + '\n';
     writeFileSync(VCTX_ERROR_LOG, line, { flag: 'a' });
-  } catch {}
+  } catch (e) {
+    // 2026-04-23 silent-catch fix (top-5 from docs/analysis/
+    // 2026-04-22-silent-catches-structuring.md §4 Q3). If the log
+    // substrate itself is broken (disk full, /tmp perms, etc.), we
+    // MUST NOT lose the error entirely — that would corrupt every
+    // post-mortem that relies on /tmp/vcontext-errors.jsonl. Fallback
+    // to stderr which launchd captures at StandardErrorPath.
+    try { console.error(`[errorLog] write failed kind=${kind}: ${e?.message || e}`); } catch {}
+  }
 }
 
 function enqueueForLater(path, data) {

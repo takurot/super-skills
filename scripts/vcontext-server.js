@@ -321,7 +321,16 @@ let _analyticsCache = {};
             process.exit(137);
           }
         }
-        try { parentPort.postMessage('ping'); } catch {}
+        try { parentPort.postMessage('ping'); } catch (e) {
+          // 2026-04-23 silent-catch fix (Tier D, top-4 from silent-catches-
+          // structuring.md §4 Q3). If ping postMessage fails, the watchdog
+          // thread loses heartbeat and the NEXT 5s tick SIGKILLs the main
+          // process (code 137). A silent catch here makes the resulting
+          // crash indistinguishable from an OS-initiated jetsam kill.
+          // Log so post-mortem can correlate ping-channel failure with
+          // the subsequent SIGKILL.
+          try { console.error('[watchdog:worker] ping postMessage failed:', e?.message || e); } catch {}
+        }
       }, 5000).unref?.();
     `, { eval: true });
     w.on('message', (m) => { if (m === 'ping') w.postMessage('pong'); });
@@ -3774,10 +3783,21 @@ async function startEmbedLoop() {
           const emb = embeddings[i];
           if (!emb || emb.length === 0) continue;
           // BLOB write path (new canonical format) — writes to both
-          // RAM and SSD under the hood.
-          try { writeEmbeddingBlob(rows[i].id, emb); } catch {}
-          try { vecUpsert(rows[i].id, emb); } catch {}
-          try { dbExec(`UPDATE entry_index SET has_embedding = 1 WHERE entry_id = ${rows[i].id};`); } catch {}
+          // RAM and SSD under the hood. 2026-04-23 silent-catch fix
+          // (Tier C, top-3 from silent-catches-structuring.md §4 Q3):
+          // previously the three catches were empty, so a partial write
+          // (e.g. blob ok but vecUpsert throws) produced the "X rows
+          // backfilled" count-vs-reality divergence. Per-step logs now
+          // correlate the exact step that failed for each entry id.
+          try { writeEmbeddingBlob(rows[i].id, emb); } catch (e) {
+            console.error(`[embed-loop:writeblob] id=${rows[i].id} failed: ${(e?.message || e || 'unknown').toString().slice(0, 150)}`);
+          }
+          try { vecUpsert(rows[i].id, emb); } catch (e) {
+            console.error(`[embed-loop:vecupsert] id=${rows[i].id} failed: ${(e?.message || e || 'unknown').toString().slice(0, 150)}`);
+          }
+          try { dbExec(`UPDATE entry_index SET has_embedding = 1 WHERE entry_id = ${rows[i].id};`); } catch (e) {
+            console.error(`[embed-loop:indexupd] id=${rows[i].id} failed: ${(e?.message || e || 'unknown').toString().slice(0, 150)}`);
+          }
         }
         // Success — reset backoff + close circuit if it was open.
         if (consecutiveFailures > 0) {
@@ -5498,7 +5518,15 @@ function vecUpsert(id, embedding) {
   try {
     const embJson = JSON.stringify(embedding).replace(/'/g, "''");
     vecDb.exec(`INSERT OR REPLACE INTO vec_entries(rowid, embedding) VALUES (${Number(id)}, vec_f32('${embJson}'))`);
-  } catch {}
+  } catch (e) {
+    // 2026-04-23 silent-catch fix (Tier C, top-2 from
+    // docs/analysis/2026-04-22-silent-catches-structuring.md §4 Q3).
+    // Previous empty catch silently broke semantic recall for that row
+    // (entry stored but vec_entries has no corresponding row → /search/
+    // semantic misses it). Log so recall-miss investigations can correlate.
+    // Still non-fatal — non-semantic recall paths keep working.
+    console.error(`[vec-upsert] failed id=${id}: ${(e?.message || e || 'unknown').toString().slice(0, 200)}`);
+  }
 }
 
 /**
