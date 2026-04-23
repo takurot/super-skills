@@ -125,20 +125,19 @@ function getFreePages() {
 // ── LLM call via mlx-generate-proxy ────────────────────────────────
 
 async function llmSummarize(content) {
-  // Thinking mode ON by design (2026-04-23 user directive: "local LLM
-  // なので compute 気にしない、品質優先"). Qwen3-8B writes a <think>...
-  // </think> reasoning block before the final answer; we give it
-  // headroom via max_tokens=32768 (well within Qwen3-8B's 32K context
-  // budget) so the thinking block completes and the actual summary
-  // reaches `content`. Without sufficient budget, the earlier
-  // max_tokens=400 variant capped the thinking block mid-sentence
-  // and left `content` empty (verified in A/B test today).
+  // Thinking mode ON + max_tokens=40960 per AIOS standing directives
+  // (lesson-learned ids 229441 / 229438: "maxTokens=40960 は品質保持の
+  // 意図的設計"). Qwen3-8B writes a <think>...</think> reasoning block
+  // before the final answer; sufficient budget is required for the
+  // thinking block to complete and the actual summary to reach
+  // `content`. User directive 2026-04-23: "local LLM なので compute
+  // 気にしない、品質優先、省略しない".
   const prompt =
     `Summarize this in one sentence (max 50 words). Output ONLY the summary, nothing else:\n\n${content.slice(0, 2000)}`;
   const body = {
     model: 'mlx-community/Qwen3-8B-4bit',
     messages: [{ role: 'user', content: prompt }],
-    max_tokens: 32768,
+    max_tokens: 40960,
     temperature: 0,
   };
   const { status, body: resp } = await httpJson('POST', MLX_GEN_URL + '/v1/chat/completions', body);
