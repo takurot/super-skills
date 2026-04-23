@@ -15,11 +15,11 @@ echo "[mlx-generate-wrapper] Starting mlx_lm.server with speculative decoding"
 echo "[mlx-generate-wrapper] main=${MODEL} draft=${DRAFT_MODEL} port=${PORT}"
 exec python3 -m mlx_lm.server \
   --model "${MODEL}" \
-  --draft-model "${DRAFT_MODEL}" \
-  --num-draft-tokens 5 \
+  `# --draft-model "${DRAFT_MODEL}"       # TEMP disabled 2026-04-23 LL1 test` \
+  `# --num-draft-tokens 5                 # TEMP disabled alongside draft-model` \
   --prompt-cache-size 8 \
   --prompt-cache-bytes 1073741824 \
   --prompt-concurrency 4 \
-  --decode-concurrency 8 \
+  --decode-concurrency 16 \
   --port "${PORT}" \
   --host "${HOST}"
