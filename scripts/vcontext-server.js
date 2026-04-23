@@ -458,7 +458,7 @@ function openDatabases() {
   ramDb.pragma('journal_mode = WAL');
   ramDb.pragma('busy_timeout = 5000');
   ramDb.pragma('cache_size = -64000');     // 64MB (default 2000 pages = 8MB)
-  ramDb.pragma('mmap_size = 268435456');   // 256MB mmap — RAM disk so basically free
+  ramDb.pragma('mmap_size = 67108864');    // 64MB mmap (P0b 2026-04-23: was 256MB; use_ramdisk=false so mmap is against SSD-backed file, page cache absorbs hot set — see docs/analysis/2026-04-23-p0b-rss-reduction-audit.md)
   ramDb.pragma('temp_store = MEMORY');     // temp tables in memory, not file
   ramDb.pragma('wal_autocheckpoint = 500'); // checkpoint every 500 pages (2MB) — minimize loss
 
@@ -467,7 +467,7 @@ function openDatabases() {
     ssdDb.pragma('journal_mode = WAL');
     ssdDb.pragma('busy_timeout = 5000');
     ssdDb.pragma('cache_size = -32000');    // 32MB for SSD
-    ssdDb.pragma('mmap_size = 134217728');  // 128MB mmap
+    ssdDb.pragma('mmap_size = 67108864');   // 64MB mmap (P0b 2026-04-23: was 128MB; cold tier, <5ms p95 impact per audit)
     ssdDb.pragma('temp_store = MEMORY');
     ssdDb.pragma('wal_autocheckpoint = 500');
   }
