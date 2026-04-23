@@ -485,13 +485,19 @@ async function main() {
   log(`keywords today: ${keywords.map(k => `"${k}"`).join(', ')}`);
   if (DRY_RUN) log('DRY RUN — no writes');
 
-  // Verify MLX is available before starting
+  // Verify MLX is available before starting. If unavailable, treat as
+  // "user opted out of LLM-backed scanning" rather than a failure —
+  // exit 0 so Check #8 doesn't flag the daily cron as unhealthy and
+  // the macOS launchd-unhealthy notification doesn't fire every
+  // morning. Same A-alt pattern as new-feature-watcher (commit
+  // 5f6ed4a) and conversation-skill-miner (commit 41f205c). Applied
+  // 2026-04-23 after popup spam from this known skip.
   try {
     const { status } = await httpGet(`${MLX_GEN}/v1/models`, { timeout: 5000 });
     if (status !== 200) throw new Error(`mlx status ${status}`);
   } catch (e) {
-    log(`ERROR: MLX generate unavailable (${e.message}). Aborting.`);
-    process.exit(2);
+    log(`[skipped] MLX generate unavailable (${e.message}). Daily scan skipped — no action needed. Enable com.vcontext.mlx-generate to reactivate.`);
+    process.exit(0);
   }
 
   const summary = {
