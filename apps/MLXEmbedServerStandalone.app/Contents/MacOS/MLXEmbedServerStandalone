@@ -22,7 +22,7 @@
 # (prod was nice=-20, new is 0). Jetsam uplift 40→100 is the primary
 # stability gain; MLX latency is dominated by GPU+memory, not CPU contention.
 
-PYTHON_BIN="${PYTHON_BIN:-/Users/mitsuru_nakajima/.pyenv/versions/3.13.2/bin/python3}"
+PYTHON_BIN="${PYTHON_BIN:-/Users/mitsuru_nakajima/.pyenv/versions/3.14.4/bin/python3}"
 SERVER_PY="${SERVER_PY:-/Users/mitsuru_nakajima/skills/scripts/mlx-embed-server-standalone.py}"
 LOG_PATH="${LOG_PATH:-/tmp/mlx-embed-server-standalone.log}"
 

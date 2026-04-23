@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-export PATH="/Users/mitsuru_nakajima/.pyenv/versions/3.13.2/bin:$PATH"
+export PATH="/Users/mitsuru_nakajima/.pyenv/versions/3.14.4/bin:$PATH"
 
 MODEL="${MLX_GENERATE_MODEL:-mlx-community/Qwen3-8B-4bit}"
 DRAFT_MODEL="${MLX_DRAFT_MODEL:-Qwen/Qwen3-0.6B-MLX-4bit}"
