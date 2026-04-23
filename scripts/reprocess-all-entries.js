@@ -237,6 +237,52 @@ function sqliteCountRemaining() {
   } catch { return null; }
 }
 
+// ── Concurrency control ────────────────────────────────────────────
+//
+// Default 2 parallel workers. Backend mlx_lm.server 0.31.2 supports
+// default_prompt_concurrency=8, default_decode_concurrency=32 so even
+// N=8 is safe headroom-wise. We start conservative at 2 per user
+// directive ("慎重 rollout") and can raise via env var.
+//
+// In-flight Set prevents two workers from picking the same entry when
+// their SELECTs race (ORDER BY created_at DESC LIMIT 1 returns the
+// same row until one worker UPDATEs reasoning). `sqliteFetchAvailable`
+// fetches a small batch and returns the first not-in-flight row.
+const CONCURRENCY = parseInt(process.env.VCTX_REPROCESS_CONCURRENCY || '2', 10);
+const inFlight = new Set();
+
+function sqliteFetchAvailable() {
+  try {
+    const limit = Math.max(10, CONCURRENCY * 3);
+    const sql =
+      `SELECT id, type, substr(content, 1, 2000) as content ` +
+      `FROM entries ` +
+      `WHERE reasoning IS NULL ` +
+      `  AND content IS NOT NULL ` +
+      `  AND LENGTH(content) >= 50 ` +
+      `  AND type != 'reprocess-progress' ` +
+      `ORDER BY created_at DESC LIMIT ${limit};`;
+    const out = execFileSync('sqlite3', ['-json', DB_PATH, sql], {
+      timeout: 10000,
+      maxBuffer: 20 * 1024 * 1024,
+    }).toString().trim();
+    if (!out) return null;
+    let rows;
+    try { rows = JSON.parse(out); } catch { return null; }
+    if (!Array.isArray(rows)) return null;
+    for (const r of rows) {
+      const id = parseInt(r.id, 10);
+      if (!Number.isFinite(id)) continue;
+      if (inFlight.has(id)) continue;
+      inFlight.add(id);
+      return { id, type: String(r.type || ''), content: String(r.content || '') };
+    }
+    return null; // all candidates in flight — caller will retry after backoff
+  } catch {
+    return null;
+  }
+}
+
 // ── Progress logging ───────────────────────────────────────────────
 
 function appendProgressLog(line) {
@@ -275,119 +321,144 @@ async function main() {
   const startedAt = Date.now();
   const startSwap = getSwapUsedMB();
   const remainingAtStart = sqliteCountRemaining();
-  appendProgressLog(`start swap=${startSwap}MB remaining=${remainingAtStart} dry_run=${DRY_RUN} max=${MAX_ENTRIES || 'unbounded'}`);
-  console.log(`[reprocess] start: remaining=${remainingAtStart} swap_baseline=${startSwap}MB dry_run=${DRY_RUN}`);
+  appendProgressLog(`start swap=${startSwap}MB remaining=${remainingAtStart} dry_run=${DRY_RUN} max=${MAX_ENTRIES || 'unbounded'} concurrency=${CONCURRENCY}`);
+  console.log(`[reprocess] start: remaining=${remainingAtStart} swap_baseline=${startSwap}MB dry_run=${DRY_RUN} CONCURRENCY=${CONCURRENCY}`);
 
-  let processed = 0;
-  let failed = 0;
-  let consecutiveFail = 0;
-  let latencyTotalMs = 0;
-  let lastProgressAt = Date.now();
-  let lastProgressProcessed = 0;
+  // Shared state across workers. Node.js is single-threaded JS so simple
+  // read/modify/write on these primitives is atomic at statement level.
+  const shared = {
+    processed: 0,
+    failed: 0,
+    consecutiveFail: 0,
+    latencyTotalMs: 0,
+    lastProgressAt: Date.now(),
+    lastProgressProcessed: 0,
+    stopFlagSeen: false,
+    drainedSeen: false,
+  };
 
-  while (!shutdown) {
-    if (existsSync(STOP_FLAG)) {
-      appendProgressLog('stop flag detected — graceful exit');
-      console.log('[reprocess] stop flag detected');
-      break;
-    }
-    if (MAX_ENTRIES !== null && processed >= MAX_ENTRIES) {
-      appendProgressLog(`max ${MAX_ENTRIES} reached`);
-      break;
-    }
-    // Note: swap / memory safety gates intentionally absent per user
-    // directive. Only (a) stop-flag, (b) SIGINT/SIGTERM, and
-    // (c) consecutive-fail counter can halt the run.
-
-    const entry = sqliteFetchOne();
-    if (!entry) {
-      appendProgressLog('drained — no more entries with reasoning IS NULL');
-      console.log('[reprocess] drained');
-      break;
-    }
-
-    const t0 = Date.now();
-    let summary;
-    try {
-      summary = await llmSummarize(entry.content);
-      consecutiveFail = 0;
-    } catch (e) {
-      failed++;
-      consecutiveFail++;
-      appendProgressLog(`fail id=${entry.id} err=${(e.message || e).toString().slice(0, 150)}`);
-      if (consecutiveFail >= MAX_CONSEC_FAIL) {
-        appendProgressLog(`stop: ${MAX_CONSEC_FAIL} consecutive mlx-generate failures`);
-        console.error(`[reprocess] stop: ${MAX_CONSEC_FAIL} consecutive failures`);
+  async function worker(wid) {
+    while (!shutdown) {
+      if (existsSync(STOP_FLAG)) {
+        if (!shared.stopFlagSeen) {
+          shared.stopFlagSeen = true;
+          appendProgressLog(`stop flag detected — graceful exit (worker=${wid})`);
+          console.log('[reprocess] stop flag detected');
+        }
         break;
       }
-      await sleep(2000); // short back-off before next entry
-      continue;
-    }
-    const latencyMs = Date.now() - t0;
-    latencyTotalMs += latencyMs;
+      if (MAX_ENTRIES !== null && shared.processed >= MAX_ENTRIES) break;
+      if (shared.consecutiveFail >= MAX_CONSEC_FAIL) break;
 
-    if (DRY_RUN) {
-      console.log(`[dry id=${entry.id} type=${entry.type} lat=${latencyMs}ms] ${summary.slice(0, 120)}`);
-    } else {
-      const ok = sqliteUpdateReasoning(entry.id, summary);
-      if (!ok) {
-        failed++;
-        appendProgressLog(`update_fail id=${entry.id}`);
+      const entry = sqliteFetchAvailable();
+      if (!entry) {
+        // No available entry (drained OR all in-flight). Check which.
+        const n = sqliteCountRemaining();
+        if (n === 0) {
+          if (!shared.drainedSeen) {
+            shared.drainedSeen = true;
+            appendProgressLog('drained — no more entries with reasoning IS NULL');
+            console.log('[reprocess] drained');
+          }
+          break;
+        }
+        // All candidates in flight — wait briefly and retry.
+        await sleep(500);
+        continue;
       }
+
+      const t0 = Date.now();
+      let summary;
+      try {
+        summary = await llmSummarize(entry.content);
+        shared.consecutiveFail = 0;
+      } catch (e) {
+        shared.failed++;
+        shared.consecutiveFail++;
+        appendProgressLog(`fail worker=${wid} id=${entry.id} err=${(e.message || e).toString().slice(0, 150)}`);
+        inFlight.delete(entry.id);
+        if (shared.consecutiveFail >= MAX_CONSEC_FAIL) {
+          appendProgressLog(`stop: ${MAX_CONSEC_FAIL} consecutive mlx-generate failures`);
+          console.error(`[reprocess] stop: ${MAX_CONSEC_FAIL} consecutive failures`);
+          break;
+        }
+        await sleep(2000); // short back-off before next entry
+        continue;
+      }
+      const latencyMs = Date.now() - t0;
+      shared.latencyTotalMs += latencyMs;
+
+      if (DRY_RUN) {
+        console.log(`[dry w${wid} id=${entry.id} type=${entry.type} lat=${latencyMs}ms] ${summary.slice(0, 120)}`);
+      } else {
+        const ok = sqliteUpdateReasoning(entry.id, summary);
+        if (!ok) {
+          // UPDATE returned changes=0 — another worker won this row. Not an
+          // error of concern; just skip counting.
+          shared.failed++;
+          appendProgressLog(`update_fail worker=${wid} id=${entry.id}`);
+        }
+      }
+      inFlight.delete(entry.id);
+      shared.processed++;
+
+      // Time-based 1-min progress (race-free: JS is single-threaded, the
+      // first worker across the threshold emits the report).
+      const sinceLastProgress = Date.now() - shared.lastProgressAt;
+      if (sinceLastProgress >= PROGRESS_INTERVAL_MS) {
+        const processedInWindow = shared.processed - shared.lastProgressProcessed;
+        const windowSec = sinceLastProgress / 1000;
+        const ratePerMin = (processedInWindow / windowSec) * 60;
+        const remaining = sqliteCountRemaining();
+        const avgLat = Math.round(shared.latencyTotalMs / Math.max(1, shared.processed));
+        const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+        const cumRatePerMin = (shared.processed / Math.max(1, elapsedSec)) * 60;
+        const etaMin = remaining !== null && ratePerMin > 0 ? Math.round(remaining / ratePerMin) : null;
+        const stats = {
+          concurrency: CONCURRENCY,
+          processed: shared.processed,
+          processed_in_last_min: Math.round(processedInWindow),
+          failed: shared.failed,
+          remaining,
+          avg_latency_ms: avgLat,
+          elapsed_sec: elapsedSec,
+          rate_per_min_window: Number(ratePerMin.toFixed(2)),
+          rate_per_min_cumulative: Number(cumRatePerMin.toFixed(2)),
+          eta_min: etaMin,
+          eta_hours: etaMin !== null ? Number((etaMin / 60).toFixed(1)) : null,
+          swap_used_mb: getSwapUsedMB(), // observed only, not a gate
+          in_flight_now: inFlight.size,
+          started_at: new Date(startedAt).toISOString(),
+        };
+        console.log(
+          `[reprocess ${new Date().toISOString().slice(11, 19)}] ` +
+          `c=${CONCURRENCY} last_min=${stats.processed_in_last_min} done=${shared.processed} ` +
+          `remaining=${remaining} avg=${avgLat}ms ` +
+          `rate=${stats.rate_per_min_window}/min eta=${stats.eta_hours}h ` +
+          `inflight=${inFlight.size} swap=${stats.swap_used_mb}MB`
+        );
+        appendProgressLog(JSON.stringify(stats));
+        await postProgress(stats);
+        shared.lastProgressAt = Date.now();
+        shared.lastProgressProcessed = shared.processed;
+      }
+
+      await sleep(RATE_SLEEP_MS);
     }
-
-    processed++;
-
-    // Progress reporting: time-based (every PROGRESS_INTERVAL_MS, default
-    // 60 s) so the user sees per-minute generation rate regardless of
-    // underlying LLM latency variance.
-    const sinceLastProgress = Date.now() - lastProgressAt;
-    if (sinceLastProgress >= PROGRESS_INTERVAL_MS) {
-      const processedInWindow = processed - lastProgressProcessed;
-      const windowSec = sinceLastProgress / 1000;
-      const ratePerMin = (processedInWindow / windowSec) * 60;
-      const remaining = sqliteCountRemaining();
-      const avgLat = Math.round(latencyTotalMs / processed);
-      const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
-      const cumRatePerMin = (processed / Math.max(1, elapsedSec)) * 60;
-      const etaMin = remaining !== null && ratePerMin > 0 ? Math.round(remaining / ratePerMin) : null;
-      const stats = {
-        processed,
-        processed_in_last_min: Math.round(processedInWindow),
-        failed,
-        remaining,
-        avg_latency_ms: avgLat,
-        elapsed_sec: elapsedSec,
-        rate_per_min_window: Number(ratePerMin.toFixed(2)),   // ← user asked for this
-        rate_per_min_cumulative: Number(cumRatePerMin.toFixed(2)),
-        eta_min: etaMin,
-        eta_hours: etaMin !== null ? Number((etaMin / 60).toFixed(1)) : null,
-        swap_used_mb: getSwapUsedMB(), // observed only, not a gate
-        started_at: new Date(startedAt).toISOString(),
-      };
-      console.log(
-        `[reprocess ${new Date().toISOString().slice(11, 19)}] ` +
-        `last_min=${stats.processed_in_last_min} done=${processed} ` +
-        `remaining=${remaining} avg=${avgLat}ms ` +
-        `rate=${stats.rate_per_min_window}/min eta=${stats.eta_hours}h ` +
-        `swap=${stats.swap_used_mb}MB`
-      );
-      appendProgressLog(JSON.stringify(stats));
-      await postProgress(stats);
-      lastProgressAt = Date.now();
-      lastProgressProcessed = processed;
-    }
-
-    await sleep(RATE_SLEEP_MS);
   }
+
+  // Spawn N concurrent workers. All share `shared` state + inFlight Set.
+  await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => worker(i)));
 
   const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
   const finalRemaining = sqliteCountRemaining();
   const summary = {
-    processed, failed,
+    processed: shared.processed,
+    failed: shared.failed,
     elapsed_sec: elapsedSec,
     elapsed_hours: Number((elapsedSec / 3600).toFixed(2)),
     remaining_at_exit: finalRemaining,
+    concurrency: CONCURRENCY,
     shutdown_reason: shutdown ? 'signal' : (existsSync(STOP_FLAG) ? 'stop_flag' : 'drained_or_max_or_fail'),
   };
   appendProgressLog(`exit ${JSON.stringify(summary)}`);
