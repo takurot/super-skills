@@ -1580,8 +1580,142 @@ async function handlePreToolGate() {
 // the tool (same convention as pre-commit-gate.sh).
 async function handlePreTool() {
   const { blocked, input } = await handlePreToolGate();
+  // M2 phase-1 shadow: log-only pre-claim evidence gate. Runs regardless
+  // of AIOS gate outcome so "would-have-blocked + AIOS also blocked" still
+  // emits a shadow entry for FP analysis. Fail-open internally on any
+  // error so M2 can never make the session worse than no-M2.
+  if (input) {
+    try {
+      const sid = extractSessionId(input);
+      await checkEvidenceGateShadow(input, sid);
+    } catch (e) { errorLog('m2_shadow_dispatch_failed', String(e?.message || e)); }
+  }
   if (blocked) return; // skip recording — gate already emitted block
   if (input) await recordEvent('pre-tool', input);
+}
+
+// ── M2 phase-1 shadow — pre-claim evidence gate (log-only) ─────────
+//
+// Spec:
+//   docs/handoff/2026-04-23-aios-self-steering-spec.md       (M2 section)
+//   docs/analysis/2026-04-22-m2-m3-m5-m6-feasibility.md      (sec 1 D6)
+//   docs/analysis/2026-04-23-q1-q5-decisions.md Q1 (C: hook-firings
+//                                                   denominator)
+//                                             Q3 (A': tool-category
+//                                                   abstraction day 1)
+//
+// Fires on PreToolUse for tools in {mutate-file, delegate} categories.
+// Scans the latest assistant message for claim keywords ("完了" / "done" /
+// etc.); if a match is present AND the recent tool-use history shows no
+// Bash/Grep/Read, emits a shadow `evidence-gate-event` for later FP/FN
+// analysis. Never blocks in phase 1.
+//
+// Promotion to phase-2 is gated on FP<5% per feasibility D6 — sampling
+// done via `/recent?type=evidence-gate-event`.
+//
+// Scope-creep guard (D5): the claim pattern is FROZEN to the spec set.
+// Any expansion requires a separate commit citing FN data.
+
+const M2_EVIDENCE_TOOLS = new Set(['Bash', 'Grep', 'Read']);
+const M2_MUTATE_FILE_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
+const M2_DELEGATE_TOOLS = new Set(['Task', 'Agent']);
+const M2_CLAIM_PATTERN = /(?:完了|完成|\bdone\b|\bcomplete(?:d)?\b|100%|zero errors?|fully verified|\bfinished\b)/i;
+const M2_REGISTRY_FLAG = '/tmp/vcontext-m2-registry-written';
+
+async function registerToolCategoryOnce() {
+  // Q3 A' phase-α: Claude Code mapping hardcoded inline AND registered as
+  // the first row of the `tool-category-registry`. Each new AI client
+  // adds one additional registry row (e.g. cursor, codex, gemini).
+  // Idempotent via /tmp sentinel — one write per process lifetime.
+  if (existsSync(M2_REGISTRY_FLAG)) return;
+  try {
+    await post('/store', {
+      type: 'tool-category-registry',
+      content: JSON.stringify({
+        ai_client: 'claude-code',
+        categories: {
+          'mutate-file': [...M2_MUTATE_FILE_TOOLS],
+          'delegate': [...M2_DELEGATE_TOOLS],
+          'execute-shell': ['Bash'],
+        },
+        registered_at: new Date().toISOString(),
+        phase: 'phase-alpha',
+      }),
+      tags: ['tool-category-registry', 'claude-code', 'm2', 'phase-alpha'],
+    });
+    try { writeFileSync(M2_REGISTRY_FLAG, new Date().toISOString()); } catch {}
+  } catch {}
+}
+
+async function checkEvidenceGateShadow(input, sessionId) {
+  try {
+    const data = JSON.parse(input);
+    const toolName = data.tool_name;
+    if (!toolName) return;
+
+    // Q3 A' category dispatch. M2 scope = {mutate-file, delegate}.
+    let toolCategory;
+    if (M2_MUTATE_FILE_TOOLS.has(toolName)) toolCategory = 'mutate-file';
+    else if (M2_DELEGATE_TOOLS.has(toolName)) toolCategory = 'delegate';
+    else return; // out of scope for M2
+
+    const transcriptPath = data.transcript_path;
+    if (!transcriptPath) return;
+
+    // Fire-and-forget registry entry (once per process).
+    registerToolCategoryOnce();
+
+    // Extract latest assistant text. Separate position file ('-m2' suffix)
+    // so we don't race with other consumers of extractNewAssistantMessages
+    // (assistant-response recorder, completion recorder).
+    const messages = extractNewAssistantMessages(transcriptPath, sessionId + '-m2');
+    if (messages.length === 0) return;
+    const latestMsg = messages[messages.length - 1];
+
+    const m = latestMsg.match(M2_CLAIM_PATTERN);
+    if (!m) return;
+    const claimKeyword = m[0];
+    const matchIdx = m.index || 0;
+    const snipStart = Math.max(0, matchIdx - 40);
+    const snipEnd = Math.min(latestMsg.length, matchIdx + claimKeyword.length + 40);
+    const claimSnippet = latestMsg.slice(snipStart, snipEnd);
+
+    // Evidence check: any Bash/Grep/Read in recent tool-uses this session.
+    // Phase-1 heuristic: last 10 tool-use entries. The tighter "since last
+    // user-prompt" scope is deferred to phase-2 (feasibility D6).
+    let hasEvidence = false;
+    try {
+      const r = await get(`/session/${encodeURIComponent(sessionId)}?type=tool-use&limit=10`);
+      const rows = (r && r.results) || [];
+      for (const row of rows) {
+        try {
+          const d = JSON.parse(row.content || '{}');
+          if (M2_EVIDENCE_TOOLS.has(d.tool_name)) { hasEvidence = true; break; }
+        } catch {}
+      }
+    } catch {}
+    if (hasEvidence) return;
+
+    // Violation — log it. Shadow mode: NO block, no stdout.
+    await post('/store', {
+      type: 'evidence-gate-event',
+      content: JSON.stringify({
+        phase: 'shadow',
+        would_have_blocked: true,
+        tool: toolName,
+        tool_category: toolCategory,
+        claim_pattern: claimKeyword,
+        claim_snippet: claimSnippet,
+        denominator_basis: 'hook-firings', // Q1 C decision
+        session_id: sessionId,
+        fired_at: new Date().toISOString(),
+      }),
+      tags: ['evidence-gate', 'shadow', 'm2', 'auto'],
+      session: sessionId,
+    });
+  } catch (e) {
+    errorLog('m2_evidence_gate_failed', String(e?.message || e));
+  }
 }
 
 // ── Universal recorder ───────────────────────────────────────────
