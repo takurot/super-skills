@@ -19,5 +19,7 @@ exec python3 -m mlx_lm.server \
   --num-draft-tokens 5 \
   --prompt-cache-size 8 \
   --prompt-cache-bytes 1073741824 \
+  --prompt-concurrency 2 \
+  --decode-concurrency 8 \
   --port "${PORT}" \
   --host "${HOST}"
