@@ -19,7 +19,7 @@ exec python3 -m mlx_lm.server \
   `# --num-draft-tokens 5                 # TEMP disabled alongside draft-model` \
   --prompt-cache-size 8 \
   --prompt-cache-bytes 1073741824 \
-  --prompt-concurrency 8 \
-  --decode-concurrency 32 \
+  --prompt-concurrency 6 \
+  --decode-concurrency 24 \
   --port "${PORT}" \
   --host "${HOST}"
