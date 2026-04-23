@@ -1905,6 +1905,70 @@ async function recordEvent(eventName, preReadInput) {
             });
           } catch {}
 
+          // M5: session-end retrospective — daily compounding meta-loop data.
+          // Aggregates M1 audit + correction / evidence-gate / skill-trigger counts
+          // into one `session-retrospective` entry. `self-evolve` consumes these
+          // across weeks to suggest hook/policy adjustments. Fail-open: any
+          // error is logged via errorLog and does not block session-end.
+          try {
+            // 1. Read the M1 audit entry just written (most recent for this session)
+            let m1Audit = null;
+            try {
+              const m1Rows = await get(`/session/${encodeURIComponent(sessionId)}?type=skill-invocation-audit&limit=1`);
+              if (m1Rows.results && m1Rows.results[0]) {
+                try { m1Audit = JSON.parse(m1Rows.results[0].content); } catch {}
+              }
+            } catch {}
+
+            // 2. correction-event count
+            let correctionEventsCount = 0;
+            let userCorrectionPatternCount = 0;
+            try {
+              const ce = await get(`/session/${encodeURIComponent(sessionId)}?type=correction-event&limit=1000`);
+              correctionEventsCount = (ce.results || []).length;
+              // 5. regex-only fast path: needs_enrichment === false
+              for (const row of (ce.results || [])) {
+                try {
+                  const d = JSON.parse(row.content);
+                  if (d.needs_enrichment === false) userCorrectionPatternCount++;
+                } catch {}
+              }
+            } catch {}
+
+            // 3. evidence-gate-event count (will be small until M2 ramps up)
+            let evidenceGateEventsCount = 0;
+            try {
+              const eg = await get(`/session/${encodeURIComponent(sessionId)}?type=evidence-gate-event&limit=1000`);
+              evidenceGateEventsCount = (eg.results || []).length;
+            } catch {}
+
+            // 4. skill-trigger count (M4 pulls these at bootstrap)
+            let skillTriggerSurfacedCount = 0;
+            try {
+              const st = await get(`/session/${encodeURIComponent(sessionId)}?type=skill-trigger&limit=100`);
+              skillTriggerSurfacedCount = (st.results || []).length;
+            } catch {}
+
+            await post('/store', {
+              type: 'session-retrospective',
+              content: JSON.stringify({
+                session_id: sessionId,
+                session_end_at: new Date().toISOString(),
+                m1_audit: m1Audit,
+                correction_events_count: correctionEventsCount,
+                evidence_gate_events_count: evidenceGateEventsCount,
+                skill_trigger_surfaced_count: skillTriggerSurfacedCount,
+                user_correction_pattern_count: userCorrectionPatternCount,
+                schema_version: 1,
+                source: 'session-end-hook',
+              }),
+              tags: ['session-retrospective', 'auto', 'm5'],
+              session: sessionId,
+            });
+          } catch (e) {
+            errorLog('m5_retrospective_failed', String(e?.message || e));
+          }
+
           // Handoff: leave a note for the next session in the same cwd.
           // Captures the last assistant message + last user prompt so a
           // follow-up session (possibly under a different account) can
