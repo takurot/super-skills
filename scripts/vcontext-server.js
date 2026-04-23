@@ -10412,6 +10412,7 @@ function shutdown(signal) {
 
   clearInterval(backupTimer);
   clearInterval(rawSyncTimer);
+  try { clearInterval(watchdogTimer); } catch {}
   // Close all WebSocket connections — cheap, non-blocking.
   for (const [id, client] of wsClients) {
     try { client.socket.destroy(); } catch {}
@@ -10511,3 +10512,35 @@ server.listen(PORT, BIND_HOST, () => {
   if (_mlxKeepAliveTimer) clearTimeout(_mlxKeepAliveTimer);
   _mlxKeepAliveTimer = setTimeout(_mlxKeepAlivePulse, 10000);
 });
+
+// Watchdog observability (P0d) — 15s-interval memory/swap logging so we can
+// empirically measure whether P0a (cat=app migration) or P0b (heap/mmap
+// reduction) shift the SIGKILL-137 cadence. Plain console.log — the top-of-
+// file monkey-patch prefixes ISO timestamps. Blocking sysctl is acceptable
+// at 15s cadence (<1ms call); swap fallback uses '?' placeholder.
+const watchdogTimer = setInterval(() => {
+  try {
+    const os = require('os');
+    const { execSync } = require('child_process');
+    const mu = process.memoryUsage();
+    const rss = Math.round(mu.rss / 1024 / 1024);
+    const heapUsed = Math.round(mu.heapUsed / 1024 / 1024);
+    const heapTotal = Math.round(mu.heapTotal / 1024 / 1024);
+    const ext = Math.round(mu.external / 1024 / 1024);
+    const sysFree = Math.round(os.freemem() / 1024 / 1024);
+    let swapStr = 'swap_used=?/?';
+    try {
+      const out = execSync('sysctl -n vm.swapusage', { timeout: 1000 }).toString();
+      const totalM = out.match(/total\s*=\s*([\d.]+)M/);
+      const usedM = out.match(/used\s*=\s*([\d.]+)M/);
+      if (totalM && usedM) {
+        const totalGB = (parseFloat(totalM[1]) / 1024).toFixed(1);
+        const usedGB = (parseFloat(usedM[1]) / 1024).toFixed(1);
+        swapStr = `swap_used=${usedGB}GB/${totalGB}GB`;
+      }
+    } catch {}
+    console.log(`[watchdog] rss=${rss}MB heap=${heapUsed}/${heapTotal}MB ext=${ext}MB sys_free=${sysFree}MB ${swapStr}`);
+  } catch (e) {
+    console.error('[watchdog] failed:', e.message);
+  }
+}, 15000);
