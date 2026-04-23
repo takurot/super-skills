@@ -23,20 +23,25 @@ if [[ -f "$WRAPPER_LOCK" ]]; then
 fi
 echo $$ > "$WRAPPER_LOCK"
 
-# Node 25 default heap ~2 GB. Multiple exit-134 / "Reached heap limit"
-# crashes observed today under burst load — raise to 4 GB so the server
-# has breathing room while handlers process large MLX responses, WS
-# fan-out, and the JSONL write queue.  System has 36 GB RAM so 4 GB is
-# a tiny share.  Override via VCONTEXT_MAX_HEAP_MB in vcontext.env.
-export NODE_OPTIONS="--max-old-space-size=${VCONTEXT_MAX_HEAP_MB:-4096} ${NODE_OPTIONS:-}"
-
-# Load runtime env overrides (VCONTEXT_BIND=0.0.0.0 for LAN, etc.)
+# Load runtime env overrides (VCONTEXT_BIND=0.0.0.0 for LAN,
+# VCONTEXT_MAX_HEAP_MB=2048 for heap cap, etc.).
+# MUST come BEFORE the NODE_OPTIONS export below so VCONTEXT_MAX_HEAP_MB
+# resolves at the ${VCONTEXT_MAX_HEAP_MB:-4096} interpolation. Prior
+# ordering (env-source below NODE_OPTIONS) made VCONTEXT_MAX_HEAP_MB a
+# silent no-op — latent bug discovered and fixed 2026-04-23 as part of
+# P0b-heap rollout. See docs/analysis/2026-04-23-p0b-rss-reduction-audit.md.
 ENV_FILE="$HOME/skills/data/vcontext.env"
 if [[ -f "$ENV_FILE" ]]; then
   set -a
   source "$ENV_FILE"
   set +a
 fi
+
+# Node 25 default heap ~2 GB. 2026-04-23 P0b-heap: capped at 2 GB via
+# VCONTEXT_MAX_HEAP_MB=2048 in vcontext.env (peak observed 820 MB,
+# 2 GB = 2.5x headroom, frees 2 GB RSS budget to system). Fallback
+# default 4096 retained for the no-env-file case.
+export NODE_OPTIONS="--max-old-space-size=${VCONTEXT_MAX_HEAP_MB:-4096} ${NODE_OPTIONS:-}"
 
 cleanup() {
   if [[ -n "$SERVER_PID" ]]; then
