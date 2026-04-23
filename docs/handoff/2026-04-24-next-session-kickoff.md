@@ -1,10 +1,12 @@
 # Next-Session Kickoff — 2026-04-24
 
-*Session 2026-04-23 (afternoon, ~5h). 5 commits shipped focused on
-SIGKILL-137 cadence break + M2 phase-1 shadow deploy. Major outcomes:
-SIGKILL-137 0 kills in 30+ min (prior cadence ~4h), sys_free floor 66x
-improvement, jetsam pri 40→100 cutover, watchdog observability live,
-evidence-gate shadow running log-only.*
+*Session 2026-04-23 (afternoon → evening, ~6h). 8 commits shipped.
+Core: SIGKILL-137 cadence break, M2 phase-1 shadow deploy, silent-
+catch top-5 cleanup, P0c circuit-breaker gap closed. Major outcomes:
+SIGKILL-137 0 kills in 60+ min (prior cadence ~4h), sys_free floor
+66x improvement, jetsam pri 40→100 cutover, watchdog observability
+live, evidence-gate shadow running log-only, mlxEmbedFast now gated
+by C11 breaker (no more 2s timeouts during MLX outage).*
 
 ---
 
@@ -34,15 +36,20 @@ sysctl -n vm.swapusage
 
 ---
 
-## Today's 5 commits (2026-04-23 afternoon)
+## Today's 8 commits (2026-04-23)
 
 ```
+80ce3e3  fix(embed): P0c — mlxEmbedFast respects circuit breaker (C11 D8)
+6bbf496  fix(silent-catches): top-5 from 2026-04-22 audit — 4 of 5 (top-1 landed eda4a95)
+90c4871  docs: P0a plist runbook + 2026-04-24 kickoff handoff
 cc02df9  feat(hooks): M2 phase-1 shadow — pre-claim evidence gate (log-only)
 907e76b  feat(vcontext): P0b-mmap 256/128 → 64 MB each (ramDb + ssdDb)
 86f5b7a  feat(vcontext): P0b-heap 4096→2048 + fix env-load ordering bug
 a069e0f  feat(vcontext): P0a cat=app migration — jetsam pri 40→100
 441fb8c  feat(vcontext): P0d 15s watchdog for RSS/heap/swap observability
 ```
+
+(Plus today's earlier commit `eda03b4` fix(article-scanner): A-alt graceful skip.)
 
 ---
 
