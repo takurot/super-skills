@@ -67,6 +67,57 @@ Quantitative floor: this session had **0 `Skill` tool calls** despite `[infinite
 - **What**: When the `careful` skill matches (production / critical), automatically add a read-only `freeze` overlay until a matching 2nd agent opinion is logged. Prevents "act first, think after" on production.
 - **Why**: tonight, cutover was on a 10-min monitor basis — narrow. M6 would have required an explicit 2nd-opinion before Phase N+1.
 
+### M7 — Config-value standing-directive recall (3-4h, added 2026-04-23)
+
+- **What**: Pre-change-write hook fires when Edit / Write modifies a
+  config-like numerical constant (`max_tokens`, `heap_size`, `timeout`,
+  `mmap_size`, etc.). Before allowing the change, query vcontext
+  lesson-learned + decision entries for the identifier and surface any
+  matching standing directives as a system-reminder requiring explicit
+  acknowledgment or counter-reasoning.
+- **Why**: Session 2026-04-23 exposed a concrete failure mode — agent
+  set `max_tokens=32768` despite lesson-learned id=229441 / 229438
+  pinning `maxTokens=40960 は品質保持の意図的設計`. The agent HAD
+  seen the lesson in SKAP bootstrap but failed to apply it at the
+  decision moment. Gap: **seeing ≠ applying**. User had to correct
+  the unilateral-shrink pattern 3+ times in one session. M7 closes
+  this specific failure mode for numerical-value directives.
+- **Phased rollout**:
+  - **Phase 1 (shadow, ~3h)**: regex-extract identifier + value from
+    tool_input; FTS search lesson-learned for identifier; if match with
+    different value, log `directive-recall-event`
+    {phase:'shadow', identifier, attempted_value, matched_lesson_ids,
+     directive_value, snippet, would_block:true}. No actual block.
+  - **Phase 2 (nudge)**: inject system-reminder into PreToolUse response
+    so AI sees "id=X says value=Y, you wrote Z — justify or match".
+  - **Phase 3 (gate)**: block write unless AI provides
+    `acknowledged_directive:id=X` tag in entry metadata.
+- **Acceptance**:
+  - 48h shadow → FP rate <10% (false matches on unrelated numbers)
+  - ≥1 true-positive reproduction of the `max_tokens` case in test
+  - "unilateral-shrink" user-correction events → 0 over 1 week
+- **Key challenges**:
+  - Identifier extraction from diff:
+    `max_tokens: 32768` / `MAX_TOKENS=32768` / `{max_tokens:32768}` patterns
+  - Lesson-match specificity: keyword overlap + optional embed-rerank
+  - FP guard: only match lessons tagged `directive` / `design` /
+    `value-preservation`; ignore incidental-number lessons
+- **First-commit concrete**:
+  ```
+  File: vcontext-hooks.js — new checkConfigDirective(input, sessionId)
+  Trigger: PreToolUse for Edit | Write | NotebookEdit
+           (Q3 A' mutate-file category)
+  Phase 1: regex/parser extract (identifier, numeric_value) pairs from
+           tool_input.new_string; for each, GET /search/semantic?q=
+           '<identifier> directive value'; if results include
+           lesson-learned entry with numeric_value matching a number ≠
+           attempted_value, log directive-recall-event.
+  Effort: ~3h for phase-1 including tests.
+  ```
+- **Recommended priority: Tier 1 next session** — today's evidence is
+  fresh and the pattern is generalizable beyond maxTokens (heap,
+  timeout, batch size, mmap, ... all susceptible to same failure).
+
 ## Implementation order (proposal, not decision)
 
 Best ROI ordering given the user's articulated pain:

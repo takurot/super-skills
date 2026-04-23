@@ -185,13 +185,27 @@ Watch triggers (どれかでも発生したら Tier 2 検討昇格):
 
 ## Tier 1 queued work (immediate, small)
 
-- [ ] **P0c mlx-embed retry storm fix** (~1.5h)
-  - Exponential backoff + circuit breaker on :3161 connection failures
-  - Prevents retry-amplification under pressure
-- [ ] **M5 session-end retrospective** (~2h)
-  - Compounds with M2 data for meta-loop feedback
-  - Writes `session-retrospective` at session-end
-- [ ] **M2 phase-2 (nudge mode)** — promote **only after 48h FP<5% confirmation**
+- [ ] **M7 Config-value directive recall** (~3-4h) — **added 2026-04-23
+      based on this session's empirical failure**
+  - Today's evidence: agent repeatedly wrote `max_tokens=32768` despite
+    lesson-learned id=229441 pinning `maxTokens=40960`. SKAP bootstrap
+    surfaced the directive but no mechanism forced recall at the
+    decision moment.
+  - Spec: docs/handoff/2026-04-23-aios-self-steering-spec.md §M7
+  - Phase 1 shadow: regex-extract identifier+value pairs; FTS-match
+    lesson-learned; log `directive-recall-event` when attempt differs.
+- [ ] **M5 session-end retrospective verification** (already shipped
+      commit 086734a — confirm it fires on next session-end, verify
+      schema, then close as done)
+- [ ] **M2 phase-2 (nudge mode)** — promote **only after 48h FP<5%
+      confirmation** (data accumulating; check 2026-04-25 evening)
+- [ ] **Python 3.14 migration candidacy review** — GA since 2025-10,
+      mlx cp314 wheel public, all critical deps compatible. Agent doc
+      at docs/analysis/2026-04-23-python-3.15-feasibility.md §5 covers
+      staging. Decide GO / HOLD; if GO, pyenv install 3.14.4 + pilot.
+- [x] ~~P0c mlx-embed retry storm fix~~ — shipped today (commit
+      80ce3e3 = mlxEmbedFast circuit-gate)
+- [x] ~~M5 session-end retrospective~~ — shipped today (commit 086734a)
 
 ---
 
