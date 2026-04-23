@@ -1,0 +1,45 @@
+#!/bin/bash
+# VContextServer — runs vcontext-wrapper.sh under the .app bundle so macOS
+# Launch Services assigns jetsam category=app (priority 100) instead of
+# cat=daemon priority 40.
+#
+# Why this wrapper (not a direct plist Program): LaunchAgent plists that run
+# a binary directly inherit cat=daemon, priority=40 from launchd. Wrapping in
+# an .app bundle + launching via `open -W -n -a` routes through LaunchServices
+# / runningboardd, which assigns cat=app, priority=100 to the .app process.
+# See docs/analysis/2026-04-23-vcontext-sigkill-137-investigation.md:127-144
+# for empirical evidence that pri=40 made vcontext the first-victim under
+# swap pressure (~4h kill cadence observed).
+#
+# Logging: open -W does NOT forward child stdout/stderr to launchd's
+# StandardOutPath — the .app's FDs are pinned to /dev/null by LaunchServices.
+# vcontext-wrapper.sh does NOT redirect $NODE "$SERVER" output either
+# (line 106: `$NODE "$SERVER" &` — no > redirection). Empirically verified
+# 2026-04-23 10:55: post-cutover node FD 1/2 both at /dev/null, log file
+# mtime frozen. Fix: redirect wrapper stdout+stderr to /tmp/vcontext-server.log
+# on the exec line below. The plist's StandardOutPath catches the `open`
+# process output only (boot/exit markers); wrapper+node output goes direct
+# to the log via the exec redirect.
+#
+# CWD: set to ~/skills to match production behavior (vcontext-wrapper.sh
+# also cd's via its own logic, but we set it here too for safety).
+#
+# Env preservation: LaunchAgent plist EnvironmentVariables propagate to
+# /usr/bin/open but NOT to the .app child under LaunchServices. The wrapper
+# script sources ~/skills/data/vcontext.env internally (vcontext-wrapper.sh:34-39),
+# so all runtime vars (VCONTEXT_BIND, VCONTEXT_MAX_HEAP_MB, etc.) are
+# preserved through that path, not through plist inheritance.
+#
+# CPU nice: runningboardd does NOT inherit the plist Nice=-5 for .app
+# children. Non-root users cannot lower nice below 0. Accepted regression
+# (prod was nice=-5, new is 0). Jetsam uplift 40→100 is the primary
+# stability gain; vcontext latency is dominated by sqlite I/O + embed
+# roundtrips, not CPU contention.
+
+WRAPPER_SH="${WRAPPER_SH:-/Users/mitsuru_nakajima/skills/scripts/vcontext-wrapper.sh}"
+
+cd /Users/mitsuru_nakajima/skills || exit 1
+
+echo "=== VContextServer .app boot $(date) args=$* ===" 1>&2
+
+exec /bin/bash "$WRAPPER_SH" "$@" >> /tmp/vcontext-server.log 2>&1
