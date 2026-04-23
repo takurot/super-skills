@@ -287,8 +287,21 @@ async function warmupDummyRequests(n) {
 }
 
 async function startMlx() {
-  // Fast path: already running.
-  if (state.value === 'RUNNING') return;
+  // Fast path: already running AND backend actually healthy.
+  // Self-heal bug fix (2026-04-23): previously this returned on state
+  // alone, but state can drift from reality when the backend is
+  // externally killed (manual `launchctl bootout`, crash, jetsam).
+  // Observed during T2 of the phase review: bootout'd :3162 manually,
+  // proxy state stayed RUNNING, subsequent /proxy/warmup returned
+  // ok:true while its dummy inferences silently failed (dummies 1/2
+  // and 2/2 both ECONNREFUSED). Self-heal: probe /health; if dead,
+  // reset to STOPPED and fall through to bootstrap.
+  if (state.value === 'RUNNING') {
+    if (await mlxIsHealthy()) return;
+    logLine('startMlx: state was RUNNING but backend unreachable — self-heal reset to STOPPED');
+    state.value = 'STOPPED';
+    // fall through to normal bootstrap path below
+  }
 
   // Coalesce concurrent callers onto the SAME starting_promise.
   // 2026-04-20 review fix: previously we checked state+promise then did
@@ -528,14 +541,29 @@ function handleProxyMetrics(req, res) {
 async function handleProxyWarmup(req, res) {
   const start = Date.now();
   try {
-    if (state.value !== 'RUNNING') {
-      await startMlx(); // includes warmupDummyRequests internally
-    } else {
-      // Already RUNNING — run extra dummies to refresh KV / JIT state.
+    // Always go through startMlx — it now has self-heal (2026-04-23
+    // bug-fix): stale RUNNING state with dead backend is detected,
+    // reset to STOPPED, and re-bootstrapped + re-warmed. Previously
+    // this had an else-branch that ran dummies directly; that branch
+    // silently swallowed ECONNREFUSED when backend was externally
+    // bootout'd, leaving state=RUNNING but backend dead.
+    // startMlx's fast-path is O(1 /health probe) when state is truly
+    // healthy, so calling it unconditionally is cheap.
+    const wasStopped = state.value !== 'RUNNING';
+    await startMlx();
+    // startMlx just bootstrapped → it already ran WARMUP_DUMMY_N
+    // dummies. If we were already warm-healthy and want explicit
+    // KV refresh, run N-1 extra dummies. Skip otherwise to avoid
+    // double-warmup work.
+    let extraMs = 0;
+    if (!wasStopped && state.value === 'RUNNING') {
       const extra = await warmupDummyRequests(Math.max(1, WARMUP_DUMMY_N - 1));
-      state.metrics.warmup_latencies_ms.push(extra.ms);
-      if (state.metrics.warmup_latencies_ms.length > 100) {
-        state.metrics.warmup_latencies_ms.shift();
+      extraMs = extra.ms;
+      if (extraMs > 0) {
+        state.metrics.warmup_latencies_ms.push(extraMs);
+        if (state.metrics.warmup_latencies_ms.length > 100) {
+          state.metrics.warmup_latencies_ms.shift();
+        }
       }
     }
     replyJson(res, 200, {
@@ -543,6 +571,7 @@ async function handleProxyWarmup(req, res) {
       state: state.value,
       total_ms: Date.now() - start,
       warm_up_ms_last: state.warm_up_ms_last,
+      extra_dummy_ms: extraMs,
       dummy_n: WARMUP_DUMMY_N,
     });
   } catch (e) {
@@ -592,21 +621,24 @@ async function handleRequest(req, res) {
       // state.value is now STOPPED; next block will bootstrap.
     }
 
-    if (state.value !== 'RUNNING') {
-      // Will throw if memory tight or warmup times out
-      try {
-        await startMlx();
-      } catch (e) {
-        const st = e.status || 503;
-        if (e.message && e.message.startsWith('memory_tight')) {
-          state.metrics.requests_503_memory++;
-        }
-        return replyJson(res, st, {
-          error: 'mlx_unavailable',
-          detail: e.message,
-          retry_after_seconds: 60,
-        });
+    // Always invoke startMlx — its fast-path (1) skips work when the
+    // backend is already healthy AND (2) self-heals when our internal
+    // state is stale (backend externally killed). Cost: one /health
+    // probe per request in the hot path (~2-5 ms), acceptable vs the
+    // silent-502 failure mode this replaces. Bug fix companion to the
+    // startMlx self-heal above.
+    try {
+      await startMlx();
+    } catch (e) {
+      const st = e.status || 503;
+      if (e.message && e.message.startsWith('memory_tight')) {
+        state.metrics.requests_503_memory++;
       }
+      return replyJson(res, st, {
+        error: 'mlx_unavailable',
+        detail: e.message,
+        retry_after_seconds: 60,
+      });
     }
 
     state.metrics.requests_forwarded++;
