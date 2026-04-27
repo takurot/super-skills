@@ -34,7 +34,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/Users/mitsuru_nakajima/.nvm/versions/node/v25.9.0/bin/node /Users/mitsuru_nakajima/skills/.claude/hooks/directive-recall.mts"
+            "command": "/Users/mitsuru_nakajima/.nvm/versions/node/v25.9.0/bin/node .claude/hooks/directive-recall.mts"
           }
         ]
       }
