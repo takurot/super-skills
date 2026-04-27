@@ -32,7 +32,7 @@ import platform
 import signal
 import sys
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler  # W3 P0: ThreadingHTTPServer for concurrent /embed (F5, 2026-04-27)
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -699,8 +699,15 @@ def main():
 
     # Port check — auto-find available port if default is taken
     import socket
+    # W3 P0: refuse to rebind into AIOS reserved port (F5)
+    RESERVED_AIOS_PORTS = {3162, 3163, 3150, 3160, 8888}  # mlx-generate-proxy, mlx-generate-backup, vcontext, mlx-embed-coreml-fallback, searxng
     port = args.port
     for attempt in range(10):
+        # W3 P0: refuse to rebind into AIOS reserved port (F5)
+        if port in RESERVED_AIOS_PORTS and port != args.port:
+            print(f"[server] Port {port} reserved for another AIOS service, skipping")
+            port += 1
+            continue
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             sock.bind((args.host, port))
@@ -715,8 +722,8 @@ def main():
         sys.exit(1)
 
     # Start server
-    server = HTTPServer((args.host, port), EmbedHandler)
-    print(f"[server] Embedding server running on http://{args.host}:{args.port}")
+    server = ThreadingHTTPServer((args.host, port), EmbedHandler)  # W3 P0: ThreadingHTTPServer for concurrent /embed (F5, 2026-04-27)
+    print(f"[server] Embedding server running on http://{args.host}:{port}")  # W3 P0: log actual bound port not args (F5)
     print(f"[server] Backend: {backend.name} | Model: {MODEL_NAME} | Dim: {EMBED_DIM}")
     print(f"[server] Platform: {platform.system()} {platform.machine()}")
     print(f"[server] Endpoints:")

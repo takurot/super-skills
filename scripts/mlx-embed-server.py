@@ -16,6 +16,7 @@ from functools import lru_cache
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
+from collections import OrderedDict  # W2 P0: LRU eviction (2026-04-27)
 
 import argparse
 
@@ -77,7 +78,13 @@ MIN_BATCH_SIZE = 1
 DEFAULT_MAX_BATCH = 1024  # Increased for stress testing
 DEFAULT_MAX_LENGTH = 8192
 DEFAULT_PORT = 8000
-DEFAULT_HOST = "0.0.0.0"
+DEFAULT_HOST = "127.0.0.1"  # W7 P1: fail-safe to loopback (Security HIGH #5)
+
+# W2 P0: LRU eviction (2026-04-27) — Stability F1
+_EMBED_CACHE_MAX = int(os.environ.get('VCTX_EMBED_CACHE_MAX', '500'))
+# W2 P0: post-call _clear_cache throttle (2026-04-27) — Stability F18
+_LAST_CLEAR_CACHE_AT = 0.0
+_CLEAR_CACHE_MIN_INTERVAL_S = 60.0
 
 # Configure logging
 def setup_logging(level: str = "INFO") -> logging.Logger:
@@ -127,7 +134,7 @@ def parse_args():
     parser.add_argument("--port", type=int, default=None,
                         help="Server port (default: 8000)")
     parser.add_argument("--host", type=str, default=None,
-                        help="Server host (default: 0.0.0.0)")
+                        help="Server host (default: 127.0.0.1)")
     return parser.parse_args()
 
 _cli_args = parse_args()
@@ -175,7 +182,8 @@ class ModelManager:
         self.model_status: Dict[str, ModelStatus] = {}  # model_name -> status
         self.model_load_times: Dict[str, float] = {}  # model_name -> load_time
         self._locks: Dict[str, asyncio.Lock] = {}  # model_name -> lock
-        self._embedding_cache: Dict[str, np.ndarray] = {}
+        # W2 P0: LRU eviction (2026-04-27) — OrderedDict + move_to_end on hit
+        self._embedding_cache: OrderedDict = OrderedDict()
         self._global_lock = asyncio.Lock()  # For managing model dict
         self.max_loaded_models = 2  # Maximum models to keep in memory
         
@@ -265,6 +273,9 @@ class ModelManager:
                 logger.info(f"Evicting model {evict_model} to make room for {new_model}")
                 del self.models[evict_model]
                 self.model_status[evict_model] = ModelStatus.UNLOADED
+                # W2 P0: symmetric eviction with self.models (F22)
+                if evict_model in self._locks:
+                    del self._locks[evict_model]
                 # Clear cache entries for this model
                 cache_keys_to_remove = [k for k in self._embedding_cache.keys() if k.startswith(f"{evict_model}:")]
                 for key in cache_keys_to_remove:
@@ -418,6 +429,8 @@ class ModelManager:
             cache_keys.append(cache_key)
             if cache_key in self._embedding_cache:
                 cached[i] = self._embedding_cache[cache_key]
+                # W2 P0: LRU eviction (2026-04-27) — recently-used stays
+                self._embedding_cache.move_to_end(cache_key)
             else:
                 to_encode_idx.append(i)
                 to_encode_text.append(text)
@@ -441,8 +454,21 @@ class ModelManager:
             for j, i in enumerate(to_encode_idx):
                 emb = pooled_np[j]
                 computed[i] = emb
-                if len(self._embedding_cache) < 500:
-                    self._embedding_cache[cache_keys[i]] = emb
+                # W2 P0: LRU eviction (2026-04-27) — always assign, then evict from front
+                self._embedding_cache[cache_keys[i]] = emb
+                while len(self._embedding_cache) > _EMBED_CACHE_MAX:
+                    self._embedding_cache.popitem(last=False)
+        else:
+            # W2 P0: cache-hit-only path — periodic purge (every 60s) to drop Metal aux allocations (F18)
+            global _LAST_CLEAR_CACHE_AT
+            now = time.time()
+            if now - _LAST_CLEAR_CACHE_AT > _CLEAR_CACHE_MIN_INTERVAL_S:
+                if _clear_cache is not None:
+                    try: _clear_cache()
+                    except Exception: pass
+                try: gc.collect()
+                except Exception: pass
+                _LAST_CLEAR_CACHE_AT = now
 
         # Assemble output in original order
         embeddings = [cached[i] if i in cached else computed[i] for i in range(len(texts))]

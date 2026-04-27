@@ -35,6 +35,7 @@ import logging
 import os
 import sys
 import time
+from collections import OrderedDict  # W3 P0: LRU eviction (F1, 2026-04-27)
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -280,7 +281,13 @@ MIN_BATCH_SIZE = 1
 DEFAULT_MAX_BATCH = 1024
 DEFAULT_MAX_LENGTH = 8192
 DEFAULT_PORT = 8000
-DEFAULT_HOST = "0.0.0.0"
+DEFAULT_HOST = "127.0.0.1"  # W7 P1: fail-safe to loopback (Security HIGH #5)
+
+# W3 P0: LRU eviction (2026-04-27) — Stability F1
+_EMBED_CACHE_MAX = int(os.environ.get('VCTX_EMBED_CACHE_MAX', '500'))
+# W3 P0: post-call _clear_cache throttle (2026-04-27) — Stability F18
+_LAST_CLEAR_CACHE_AT = 0.0
+_CLEAR_CACHE_MIN_INTERVAL_S = 60.0
 
 
 # Cache-API compat — same tolerant probing as the original.
@@ -376,7 +383,8 @@ class ModelManager:
         self.model_status: Dict[str, ModelStatus] = {}
         self.model_load_times: Dict[str, float] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
-        self._embedding_cache: Dict[str, np.ndarray] = {}
+        # W3 P0: LRU eviction (2026-04-27) — OrderedDict + move_to_end on hit (F1)
+        self._embedding_cache: OrderedDict = OrderedDict()
         self._global_lock = asyncio.Lock()
 
     def _resolve_model_name(self, identifier: Optional[str]) -> str:
@@ -497,6 +505,8 @@ class ModelManager:
             cache_keys.append(key)
             if key in self._embedding_cache:
                 cached[i] = self._embedding_cache[key]
+                # W3 P0: LRU eviction (2026-04-27) — recently-used stays (F1)
+                self._embedding_cache.move_to_end(key)
             else:
                 to_encode_idx.append(i)
                 to_encode.append(text)
@@ -510,8 +520,21 @@ class ModelManager:
             for j, i in enumerate(to_encode_idx):
                 emb = pooled_np[j]
                 computed[i] = emb
-                if len(self._embedding_cache) < 500:
-                    self._embedding_cache[cache_keys[i]] = emb
+                # W3 P0: LRU eviction (2026-04-27) — always assign, then evict from front (F1)
+                self._embedding_cache[cache_keys[i]] = emb
+                while len(self._embedding_cache) > _EMBED_CACHE_MAX:
+                    self._embedding_cache.popitem(last=False)
+        else:
+            # W3 P0: cache-hit-only path — periodic purge (every 60s) to drop Metal aux allocations (F18)
+            global _LAST_CLEAR_CACHE_AT
+            now = time.time()
+            if now - _LAST_CLEAR_CACHE_AT > _CLEAR_CACHE_MIN_INTERVAL_S:
+                if _clear_cache is not None:
+                    try: _clear_cache()
+                    except Exception: pass
+                try: gc.collect()
+                except Exception: pass
+                _LAST_CLEAR_CACHE_AT = now
 
         out = [cached[i] if i in cached else computed[i] for i in range(len(texts))]
         return np.array(out, dtype=np.float32), model_name, emb_dim
