@@ -1,5 +1,8 @@
 # Infinite Skills
 
+> Status: 2026-04-27. AIOS Constitution active (`docs/principles/AIOS-CONSTITUTION.md`).
+> See `CHANGELOG.md` for the 2026-04-18 → 27 stabilization sprint.
+
 > (Repo / GitHub remote is still named `super-skills` for continuity with
 > upstream, but the auto-routing skill and all internal references were
 > renamed to `infinite-skills` on 2026-04-17.)
@@ -79,7 +82,7 @@ super-skills/
 │   ├── plan-product/SKILL.md   # Product planning
 │   ├── review/SKILL.md         # Code review
 │   ├── guard/SKILL.md          # Safety guard
-│   └── ... (24 skills total)
+│   └── ... (47 skills total)
 ├── scripts/                    # Build & install tools
 │   ├── build-all.js            # Build all targets
 │   ├── build-claude-skills.js  # → .claude/skills/
@@ -115,7 +118,7 @@ super-skills/
 | Kiro | `.kiro/skills/` | SKILL.md + kiro.json |
 | Antigravity | `.antigravity/skills/` | SKILL.md + catalog.json |
 
-## Skills (24)
+## Skills (47)
 
 ### Workflow Skills
 - **investigate** — Root-cause-first debugging

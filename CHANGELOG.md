@@ -1,5 +1,115 @@
 # Changelog
 
+## 2026-04-18 → 2026-04-27 — Stabilization, Constitution, M7
+
+### Architecture
+
+- **2026-04-20**: AIOS Constitution authored (`docs/principles/AIOS-CONSTITUTION.md`).
+  4 axioms (AIOS is an OS for AI; AI evolves AIOS; co-evolution),
+  6 principles (P1-P6), 4 HITL tiers (H1-H4). All future architectural
+  decisions reference this document.
+- **2026-04-20**: Loose-coupling backup process extraction. The in-process
+  `doBackup()` was decoupled from the event loop, preventing SIGKILL
+  cascades that previously caused 28 GB WAL runaway. Per
+  `docs/specs/2026-04-20-true-loose-coupling-redesign.md`.
+- **2026-04-21**: Stage 4.5 spec for eliminating residual `primary.sqlite`
+  external callers (`docs/specs/2026-04-21-stage-4.5-spec.md`). 20 call
+  sites identified across 9 files; cleanup pass to retire direct-to-SQLite
+  in favor of HTTP via `vcontext-server`.
+- **2026-04-21**: AIOS shared-knowledge access protocol
+  (`docs/specs/2026-04-21-aios-shared-knowledge-access-protocol.md`) and
+  `docs/principles/shared-knowledge-source-of-truth.md` — vcontext is
+  the canonical store; local caches reference ids, not duplicate prose.
+
+### Self-steering / hooks
+
+- **2026-04-22**: Anomaly → skill-trigger reactive wiring (6 unconnected
+  alerts now route to the trigger pipeline). Embedding-backlog metric
+  split into eligible / skipped / raw for actionable observability.
+- **2026-04-23**: Self-steering meta-loop spec
+  (`docs/handoff/2026-04-23-aios-self-steering-spec.md`).
+  M1-M7 mechanisms graduated from discipline to system enforcement.
+  M1 lands as passive skill-invocation audit at session-end; M4 surfaces
+  anomaly-driven skill triggers at bootstrap.
+- **2026-04-24**: M2 phase-1 shadow hook (pre-claim evidence gate, log-only)
+  and M5 session-end retrospective (log-only, daily-compounding).
+- **2026-04-27**: M7 phase-2 hook deployed
+  (`/Users/mitsuru_nakajima/skills/.claude/hooks/directive-recall.mts`).
+  PreToolUse intercept for Edit/Write/NotebookEdit; queries vcontext for
+  matching directive entries; injects nudge when value ≠ directive
+  (no block).
+
+### Stability
+
+- **2026-04-22**: 2026-04-22 pre-existing MLX pipeline issues catalogued
+  (`docs/analysis/2026-04-22-pre-existing-mlx-pipeline-issues.md`);
+  ISO-8601 timestamps prepended to vcontext `console.*` for grep-able logs.
+- **2026-04-23**: Silent-`catch{}` audit identified top-5; 4-of-5 fixed
+  in `6bbf496` (top-1 was `eda4a95`: `/store` embedding persistence
+  errors are now logged instead of swallowed).
+- **2026-04-23**: P0a-d vcontext stability pass — jetsam priority 40→100
+  (`cat=app` migration), Node heap 4096→2048 MB, mmap 256/128 → 64 MB
+  per DB, 15s RSS/heap/swap watchdog probe.
+- **2026-04-23**: Python runtime cutover 3.13.2 → 3.14.4 for both MLX
+  Python services (`mlx-embed-server`, `mlx-generate-proxy/wrapper`).
+  Slight transitive bumps; cp314 wheels verified.
+- **2026-04-24**: mlx-proxy S1 — post-spawn JIT warmup + `/proxy/warmup`
+  endpoint. mlx-proxy U3a — self-heal when `state=RUNNING` but backend
+  dead. Embed P0c — `mlxEmbedFast` respects circuit breaker.
+- **2026-04-26 → 27**: Reprocess pipeline (`feat(reprocess): per-entry LLM
+  annotation for ALL 132K entries`); thinking mode ON,
+  `max_tokens=32768→40960` per standing directive; multi-line content
+  fix for `sqliteFetchOne`. Concurrency tuning landed at
+  `prompt-concurrency=6`, `decode-concurrency=24` (after 8/32 502 storm).
+- **2026-04-27**: AIOS source review found 50 issues across 3 dimensions
+  (QA / security / stability) — see
+  `docs/analysis/2026-04-27-aios-source-review.md`.
+  CRITICAL: 7 (2 security RCE-class, 5 stability incl. unbounded
+  MLX queue).
+- **2026-04-27**: Phase 2.5 OS-policy spec
+  (`docs/specs/2026-04-27-aios-os-policy.md`). 14 acceptance criteria
+  across 8 groups (time / budget / data / failure / truth /
+  self-knowledge / role / concurrency). Reframes ad-hoc fixes as
+  policy-derived enforcement.
+- **2026-04-27**: mlx-generate KV cache bounded
+  (`scripts/mlx-generate-wrapper.sh`). Was: `--prompt-cache-size 8
+  --prompt-cache-bytes 0` (unlimited). Now: `--prompt-cache-size 2
+  --prompt-cache-bytes 1073741824` (1 GiB cap). Prevents jetsam SIGKILL
+  observed at 03:18Z 2026-04-27.
+
+### Standing directives (lessons-learned)
+
+- **2026-04-23**: User directive established: "local LLM なので compute
+  気にしない、品質優先、省略しない" → `maxTokens=40960` design intent
+  (lesson-learned id=229441/229438). Must not be reduced without
+  acknowledged_directive override.
+- **2026-04-27**: Standing directive enforcement codified as AC-B4 in
+  `docs/specs/2026-04-27-aios-os-policy.md` and runtime-enforced by
+  the M7 hook.
+
+### Documentation
+
+- **2026-04-21**: Self-steering meta-loop M1-M6 handoff
+  (`docs/handoff/2026-04-22-mlx-standalone-rollback.md` and adjacent).
+- **2026-04-23**: Q1-Q5 decisions + adversarial audit
+  (`docs/analysis/aab292e`).
+- **2026-04-26**: Python 3.15 feasibility analysis — HOLD verdict
+  (`docs/analysis/2026-04-26-python-3.15-feasibility.md`).
+- **2026-04-27**: Orphaned `docs/SPEC.md` and `docs/PLAN.md` archived
+  to `docs/archive/` (referenced deleted
+  `ref/gstack` / `ref/everything-claude-code`).
+- **2026-04-27**: This CHANGELOG entry (γ4 update).
+
+### Known rot (carried forward)
+
+- 72 self-evolve patches accumulating in `data/pending-patches/` with
+  no consumer.
+- `data/snapshots/` 17 GB without retention policy (AC-C1 to address).
+- 14 manifest skills missing from FS (`spec-driven-dev`, `quality-gate`,
+  ...). Investigation γ2 ongoing 2026-04-27.
+- `scripts/vcontext-hooks.draft.mts` 7-day idle TS-strict migration draft.
+- LaunchAgent cron clusters at 05/06/07/09:00.
+
 ## 2026-04-17
 
 A single-day stabilization & performance sweep (80+ commits).
