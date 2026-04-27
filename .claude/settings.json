@@ -28,6 +28,15 @@
             "command": "/Users/mitsuru_nakajima/skills/scripts/vcontext-hook-wrapper.sh pre-tool"
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mitsuru_nakajima/.nvm/versions/node/v25.9.0/bin/node /Users/mitsuru_nakajima/skills/.claude/hooks/directive-recall.mts"
+          }
+        ]
       }
     ],
     "PostToolUse": [
