@@ -1,3 +1,17 @@
+> # ⚠️ ARCHIVED 2026-04-27 (γ3)
+>
+> This document is orphaned: it references `ref/gstack` /
+> `ref/everything-claude-code` directories that were deleted from the
+> repository. Source-of-truth has moved to:
+>
+> - **AIOS principles**: `docs/principles/AIOS-CONSTITUTION.md`
+> - **Active specs**: `docs/specs/` (per-feature, dated)
+> - **Active runbook**: `docs/runbook/` and `RECOVERY.md`
+>
+> Preserved here for historical context only. Do not derive new work from this.
+
+---
+
 # Super Skills Unified Spec
 
 ## Purpose
