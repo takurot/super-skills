@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "_comment": "AIOS OS-layer policy. Generated 2026-04-27 from spec docs/specs/2026-04-27-aios-os-policy.md. User-approved Q1-Q4 2026-04-27.",
+  "mlx": {
+    "max_concurrency": 1,
+    "max_tokens_default": 40960,
+    "queue_max": 6,
+    "rationale_ref": "lesson-learned id=229441/229438; user directive 2026-04-23 'local LLM なので compute 気にしない、品質優先、省略しない'"
+  },
+  "data": {
+    "snapshot_retention_days": 7,
+    "snapshot_retention_monthly": 12,
+    "wal_rotate_size_mb": 100,
+    "wal_keep_count": 5,
+    "data_dir_warn_gb": 25,
+    "data_dir_max_gb": 30
+  },
+  "tier": {
+    "downgrade_warn_after_sec": 60,
+    "auto_recover_attempts": 3
+  },
+  "endpoints": {
+    "default_loopback_scope": ["ops", "dev", "dangerous"],
+    "default_loopback_scope_phase2_after": "2026-05-15",
+    "dangerous_require_cli_token": true
+  }
+}
