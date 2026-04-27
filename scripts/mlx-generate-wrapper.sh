@@ -17,7 +17,10 @@ exec python3 -m mlx_lm.server \
   --model "${MODEL}" \
   `# --draft-model "${DRAFT_MODEL}"       # TEMP disabled 2026-04-23 LL1 test` \
   `# --num-draft-tokens 5                 # TEMP disabled alongside draft-model` \
-  --prompt-cache-size 8 \
+  `# α-FIX 2026-04-27: bound prompt cache to prevent jetsam SIGKILL` \
+  `# was: --prompt-cache-size 8 --prompt-cache-bytes 0 (unlimited)` \
+  `# evidence: pid 84580 killed exit=-9 03:18Z, swap 11+/12 GB at death` \
+  --prompt-cache-size 2 \
   --prompt-cache-bytes 1073741824 \
   --prompt-concurrency 6 \
   --decode-concurrency 24 \
