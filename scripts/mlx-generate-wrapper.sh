@@ -22,7 +22,9 @@ exec python3 -m mlx_lm.server \
   `# evidence: pid 84580 killed exit=-9 03:18Z, swap 11+/12 GB at death` \
   --prompt-cache-size 2 \
   --prompt-cache-bytes 1073741824 \
-  --prompt-concurrency 6 \
+  `# N=1 commitment 2026-04-27: prompt-concurrency 6 → 1 (memory budget under unified-memory ceiling)` \
+  `# Was 6 (post-tune commit 98c4ff5); 1 prevents jetsam recurrence (see CHANGELOG 2026-04-27).` \
+  --prompt-concurrency 1 \
   --decode-concurrency 24 \
   --port "${PORT}" \
   --host "${HOST}"
