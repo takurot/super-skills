@@ -363,6 +363,14 @@ async function dispatch(task, mlxHolderId = null) {
     if (task_type === 'locomo-eval') {
       result = await runLocomoEval(payload, mlxHolderId);
     } else if (task_type === 'shell-command') {
+      // W6 P1: defense-in-depth — only CLI-originated tasks can run shell (Security CRITICAL #2)
+      // The HTTP /admin/task-request handler refuses shell-command at the boundary,
+      // but a stale queue row or future code path could still surface here. Refuse
+      // unless the task is explicitly marked CLI-origin (or env override is set).
+      const allowShell = process.env.AIOS_TASK_RUNNER_ALLOW_SHELL === '1' || task.source === 'cli';
+      if (!allowShell) {
+        throw new Error(`shell-command refused: not CLI-originated (source=${task.source || 'unset'}, AIOS_TASK_RUNNER_ALLOW_SHELL=${process.env.AIOS_TASK_RUNNER_ALLOW_SHELL || 'unset'})`);
+      }
       result = await runShellCommand(payload);
     } else if (task_type === 'skill-discovery-adhoc') {
       result = await runSkillDiscoveryAdhoc(payload, mlxHolderId);

@@ -68,6 +68,12 @@ import { esc, ftsQuery, estimateTokens, parseTags } from './lib/vcontext-utils.j
 import { initOtel, getTracer, otelStatus } from './lib/otel.js';
 const require = createRequire(import.meta.url);
 
+// Y-SYNC re-apply of W11' P0 (mlxBudget integration, AC-B2) — OS-layer policy
+// reader and per-minute MLX token-budget allocator. See
+// docs/specs/2026-04-27-aios-os-policy.md.
+const aiosPolicy = require('./lib/aios-policy.cjs');
+const mlxBudget = require('./lib/mlx-budget.cjs');
+
 // ── Configuration ──────────────────────────────────────────────
 const PORT = parseInt(process.env.VCONTEXT_PORT || '3150', 10);
 // 2026-04-18: primary DB migrated from 18 GB RAM disk to internal NVMe SSD.
@@ -202,12 +208,59 @@ function saveApiKeys(data) {
   mkdirSync(BACKUP_DIR, { recursive: true });
   writeFileSync(API_KEYS_PATH, JSON.stringify(data, null, 2), 'utf-8');
 }
+
+// ── Per-process local trust token (W5 P1 Security CRITICAL #1, F1) ─
+// Closes the "loopback = owner role with no auth" exploit:
+// previously any local process under the user could curl localhost:3150
+// and act as owner. Now unauthenticated requests get role='viewer';
+// callers that legitimately need owner privileges read this token from
+// ~/.config/aios/local.token (mode 0600) and pass it as
+// X-AIOS-Local-Token: <hex> on every request.
+//
+// Trusted CLI clients (dashboard, smoke-test.sh, hooks, etc.) are out of
+// scope for this worker — they will be migrated separately and continue
+// to function in the meantime as 'viewer' (read-only operations still
+// work; admin/destructive ops require the token + role + CSRF stack).
+const LOCAL_TOKEN_DIR = join(process.env.HOME, '.config', 'aios');
+const LOCAL_TOKEN_PATH = join(LOCAL_TOKEN_DIR, 'local.token');
+let LOCAL_TOKEN = '';
+try {
+  const fsLT = require('node:fs');
+  if (!fsLT.existsSync(LOCAL_TOKEN_PATH)) {
+    fsLT.mkdirSync(LOCAL_TOKEN_DIR, { recursive: true, mode: 0o700 });
+    const token = require('node:crypto').randomBytes(32).toString('hex');
+    fsLT.writeFileSync(LOCAL_TOKEN_PATH, token + '\n', { mode: 0o600 });
+    fsLT.chmodSync(LOCAL_TOKEN_PATH, 0o600);
+  }
+  LOCAL_TOKEN = fsLT.readFileSync(LOCAL_TOKEN_PATH, 'utf-8').trim();
+  // Enforce 0600 on each load — defends against accidental chmod
+  // by another tool between server starts.
+  fsLT.chmodSync(LOCAL_TOKEN_PATH, 0o600);
+} catch (e) {
+  console.error('[security] could not init local token:', e.message);
+  LOCAL_TOKEN = '';  // empty → fail-closed: unauthenticated requests get 'viewer', not 'owner'
+}
+
 function validateApiKey(req) {
   const authHeader = req.headers['authorization'] || '';
+  const xLocalToken = req.headers['x-aios-local-token'] || '';
   const key = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-  if (!key) {
-    // No key = local access, owner role with wildcard groups
+  // W5 P1: explicit local-token presents owner; bare loopback = viewer.
+  // The previous behavior (no key → auto-owner) was Security CRITICAL #1
+  // (F1) — any local process trivially obtained role='owner' with
+  // groups=['*']. Now owner requires either (a) a valid Bearer key with
+  // role='owner', or (b) the X-AIOS-Local-Token header matching the
+  // 0600-mode file at ~/.config/aios/local.token.
+  if (!key && xLocalToken && LOCAL_TOKEN && xLocalToken === LOCAL_TOKEN) {
     return { valid: true, userId: LOCAL_USER_ID, local: true, role: 'owner', groups: ['*'] };
+  }
+  if (!key) {
+    // No bearer + no/wrong local token = unauthenticated viewer.
+    // Read-only endpoints (/recall, /recent, /health) still work for
+    // backwards-compat with existing clients that have not yet been
+    // migrated to read the local token. Destructive admin endpoints
+    // separately enforce hasRole(auth,'admin') and reject viewer.
+    return { valid: true, userId: LOCAL_USER_ID, local: true, role: 'viewer', groups: [] };
   }
   const keys = loadApiKeys();
   const entry = keys.keys[key];
@@ -1378,18 +1431,41 @@ function sendJson(res, status, data) {
   if (data && typeof data === 'object') data = maskSecrets(data);
   // If data has results array, stream it to avoid building huge string in memory
   if (data.results && Array.isArray(data.results) && data.results.length > 500) {
+    // CALLER TRACE (2026-04-24 export-heap-spike investigation):
+    // this streaming branch is called by /recall, /recent, /feed, etc.
+    // for >500-result responses. Same back-pressure class as /export.
+    try {
+      const req = res.req || {};
+      const ua = (req.headers && req.headers['user-agent']) || '-';
+      const raddr = (req.socket && (req.socket.remoteAddress || '')) || '';
+      const url = req.url || '-';
+      console.log(`[sendjson-stream-trace] ${new Date().toISOString()} url=${url} n=${data.results.length} remote=${raddr} ua=${JSON.stringify(ua)}`);
+    } catch { /* logging must never throw */ }
     res.writeHead(status, { 'Content-Type': 'application/json', 'Transfer-Encoding': 'chunked' });
     // Write opening: everything except results array
     const { results, ...meta } = data;
     const metaStr = JSON.stringify(meta);
-    // Insert results array into the JSON stream
-    res.write(metaStr.slice(0, -1) + ',"results":[');
-    for (let i = 0; i < results.length; i++) {
-      if (i > 0) res.write(',');
-      res.write(JSON.stringify(results[i]));
-    }
-    res.write(']}');
-    res.end();
+    // HTTP back-pressure fix (2026-04-24): honor res.write() return value.
+    // Prior bug: ignoring false return buffered chunks in WriteWrap._chunks
+    // until socket drained — observed 600-900MB heap spikes per call for
+    // 1000-row session audits. writeOrWait awaits 'drain' so the kernel
+    // send buffer throttles production to match consumption.
+    const writeOrWait = (chunk) =>
+      res.write(chunk) ? Promise.resolve() : new Promise((resolve) => res.once('drain', resolve));
+    (async () => {
+      try {
+        await writeOrWait(metaStr.slice(0, -1) + ',"results":[');
+        for (let i = 0; i < results.length; i++) {
+          if (i > 0) await writeOrWait(',');
+          await writeOrWait(JSON.stringify(results[i]));
+        }
+        await writeOrWait(']}');
+        res.end();
+      } catch (e) {
+        // Never throw from a response writer — socket may already be closed.
+        try { res.destroy(e); } catch {}
+      }
+    })();
     return;
   }
   // Normal path for small responses
@@ -1596,7 +1672,7 @@ async function handleStore(req, res) {
       try {
         const summary = await mlxGenerate(
           `Summarize this in one sentence (max 50 words). Output ONLY the summary, nothing else:\n\n${content.slice(0, 2000)}`,
-          { maxTokens: 400, noThink: true }
+          { maxTokens: 400, noThink: true, caller: 'auto-summarize' }
         );
         if (summary && summary.length > 5) {
           dbExec(`UPDATE entries SET reasoning = ${esc(summary.trim())} WHERE id = ${entry.id} AND reasoning IS NULL;`);
@@ -1730,7 +1806,12 @@ async function handleStore(req, res) {
             if (mlxGenerateAvailable) {
               setImmediate(async () => {
                 try {
-                  const aiResponse = await mlxGenerate(basePrompt, { maxTokens: 40960, temperature: 0.1 });
+                  // W1-REVERT P0 (2026-04-27): max_tokens=40960 is the AIOS standing directive
+                  // for quality preservation (lesson-learned id=229441/229438; user directive
+                  // 2026-04-23: "local LLM なので compute 気にしない、品質優先、省略しない").
+                  // Under N=1 sequential (_MLX_QUEUE_MAX=6), peak demand = 1 × 40960 — within budget.
+                  // W1 attempted to reduce to 2000; reverted as 3rd violation of standing directive.
+                  const aiResponse = await mlxGenerate(basePrompt, { maxTokens: parseInt(process.env.VCTX_MAXTOKENS_AUTO_CONSULT || '40960', 10), temperature: 0.1, caller: 'auto-consult' });
                   if (aiResponse) {
                     try {
                       const aiParsed = JSON.parse(aiResponse);
@@ -2522,7 +2603,16 @@ function handleTrace(req, res) {
  * of thousands of entries — building one string OOMs on large dumps and
  * the caller can stream parse.
  */
-function handleExport(req, res) {
+async function handleExport(req, res) {
+  // CALLER TRACE (2026-04-24 export-heap-spike investigation):
+  // log who hit /export + query + UA + remote address so we can
+  // correlate with heap spikes. Remove after caller identified.
+  try {
+    const ua = req.headers['user-agent'] || '-';
+    const xfwd = req.headers['x-forwarded-for'] || '';
+    const raddr = (req.socket && (req.socket.remoteAddress || '')) || '';
+    console.log(`[export-trace] ${new Date().toISOString()} url=${req.url} remote=${raddr} xfwd=${xfwd} ua=${JSON.stringify(ua)}`);
+  } catch { /* logging must never throw */ }
   const auth = validateApiKey(req);
   if (!auth.valid) return sendJson(res, 401, { error: 'Invalid API key' });
   // Owner-only: the full corpus includes decisions, private notes,
@@ -2578,7 +2668,12 @@ function handleExport(req, res) {
     include_sensitive: includeSensitive,
     notes: 'NDJSON. Line 1 is this header, remaining lines are entries. Secrets masked via maskSecrets() (sk-*, JWTs, AWS keys). Import by POSTing entries back via /store.',
   };
-  res.write(JSON.stringify(header) + '\n');
+  // HTTP back-pressure fix (2026-04-24): honor res.write() return value.
+  // Same class as sendJson streaming branch — unbounded res.write on a
+  // slow consumer buffered chunks in WriteWrap._chunks until drain.
+  const writeOrWait = (chunk) =>
+    res.write(chunk) ? Promise.resolve() : new Promise((resolve) => res.once('drain', resolve));
+  await writeOrWait(JSON.stringify(header) + '\n');
 
   let lastId = sinceId;
   let written = 0;
@@ -2590,7 +2685,7 @@ function handleExport(req, res) {
     try {
       rows = dbQuery(`SELECT ${schemaCols.join(', ')} FROM entries WHERE id > ${lastId} ORDER BY id ASC LIMIT ${pageLimit};`);
     } catch (e) {
-      res.write(JSON.stringify({ __error: e.message }) + '\n');
+      await writeOrWait(JSON.stringify({ __error: e.message }) + '\n');
       break;
     }
     if (rows.length === 0) break;
@@ -2603,7 +2698,7 @@ function handleExport(req, res) {
         // maskSecrets walks arrays/objects recursively and scrubs known
         // secret patterns from string fields (same helper /recall uses).
         const masked = maskSecrets(row);
-        res.write(JSON.stringify(masked) + '\n');
+        await writeOrWait(JSON.stringify(masked) + '\n');
         written++;
         lastId = row.id;
         if (written >= maxEntries) break;
@@ -2612,7 +2707,7 @@ function handleExport(req, res) {
   }
 
   // Trailer line with totals (still valid NDJSON — each line is independent)
-  res.write(JSON.stringify({ __trailer: true, written, last_id: lastId, batches }) + '\n');
+  await writeOrWait(JSON.stringify({ __trailer: true, written, last_id: lastId, batches }) + '\n');
   res.end();
 }
 
@@ -4579,7 +4674,7 @@ Output (1-2 sentences):`;
 
   let summary;
   try {
-    summary = await mlxGenerate(prompt, { maxTokens: 300, noThink: true });
+    summary = await mlxGenerate(prompt, { maxTokens: 300, noThink: true, caller: 'chunk-summary-l1' });
   } catch (e) {
     console.error(`[chunk-summary] ${chunkId}: generate failed:`, (e.message || e).toString().slice(0, 120));
     return;
@@ -4611,6 +4706,9 @@ const CHUNK_SUMMARY_L2_INTERVAL_MS = 30 * 60 * 1000; // check every 30 min
 async function startChunkSummaryL2Loop() {
   if (chunkSummaryL2LoopRunning) return;
   chunkSummaryL2LoopRunning = true;
+  // W4 P0: initial offset to stagger L2 from L1 (F11) — prevents :00 boundary burst
+  const L2_OFFSET_MS = parseInt(process.env.VCTX_CHUNK_SUMMARY_L2_OFFSET_MS || '600000', 10);
+  await new Promise(r => setTimeout(r, L2_OFFSET_MS));
   while (chunkSummaryL2LoopRunning) {
     _loopHeartbeat.chunk_summary_l2 = Date.now();
     _loopHeartbeat.chunk_summary_l2_iter++;
@@ -4697,7 +4795,7 @@ Output (3-5 sentences):`;
 
   let summary;
   try {
-    summary = await mlxGenerate(prompt, { maxTokens: 600, noThink: true });
+    summary = await mlxGenerate(prompt, { maxTokens: 600, noThink: true, caller: 'chunk-summary-l2' });
   } catch (e) {
     console.error(`[chunk-summary-l2] ${dayId}: generate failed:`, (e.message || e).toString().slice(0, 120));
     return { error: e.message, chunk_id: dayId };
@@ -4729,6 +4827,9 @@ const CHUNK_SUMMARY_L3_INTERVAL_MS = 60 * 60 * 1000; // check every 60 min
 async function startChunkSummaryL3Loop() {
   if (chunkSummaryL3LoopRunning) return;
   chunkSummaryL3LoopRunning = true;
+  // W4 P0: initial offset to stagger L3 from L1/L2 (F11) — prevents :00 boundary burst
+  const L3_OFFSET_MS = parseInt(process.env.VCTX_CHUNK_SUMMARY_L3_OFFSET_MS || '1200000', 10);
+  await new Promise(r => setTimeout(r, L3_OFFSET_MS));
   while (chunkSummaryL3LoopRunning) {
     _loopHeartbeat.chunk_summary_l3 = Date.now();
     _loopHeartbeat.chunk_summary_l3_iter++;
@@ -4803,7 +4904,7 @@ THEMES: <theme1>, <theme2>, <theme3>`;
 
   let raw;
   try {
-    raw = await mlxGenerate(prompt, { maxTokens: 800, noThink: true });
+    raw = await mlxGenerate(prompt, { maxTokens: 800, noThink: true, caller: 'chunk-summary-l3' });
   } catch (e) {
     console.error(`[chunk-summary-l3] ${weekId}: generate failed:`, (e.message || e).toString().slice(0, 120));
     return { error: e.message, chunk_id: weekId };
@@ -4891,7 +4992,12 @@ Recent questions: ${sanitizeForExternalSearch(promptStr || 'general development'
 Agent tasks: ${sanitizeForExternalSearch(agentStr || 'code review, testing')}
 
 Search query:`;
-          const generated = await mlxGenerate(topicPrompt, { maxTokens: 40960, temperature: 0.7 });
+          // W1-REVERT P0 (2026-04-27): max_tokens=40960 is the AIOS standing directive
+          // for quality preservation (lesson-learned id=229441/229438; user directive
+          // 2026-04-23: "local LLM なので compute 気にしない、品質優先、省略しない").
+          // Under N=1 sequential (_MLX_QUEUE_MAX=6), peak demand = 1 × 40960 — within budget.
+          // W1 attempted to reduce to 600; reverted as 3rd violation of standing directive.
+          const generated = await mlxGenerate(topicPrompt, { maxTokens: parseInt(process.env.VCTX_MAXTOKENS_DISCOVERY || '40960', 10), temperature: 0.7, caller: 'discovery' });
           if (generated && generated.length > 5) {
             topic = sanitizeForExternalSearch(generated.trim().split('\n')[0]);
           }
@@ -4957,7 +5063,12 @@ async function runOnePrediction() {
         const triggerPrompt = `Given these user prompts that matched NO skill:\n${gaps.map(g => `- "${g}"`).join('\n')}\n\nFor each prompt, output 2-3 Japanese/English keywords (pipe-separated) that would identify similar future prompts. Format: one line per prompt, keywords only.\nExample: 改善|improve|better`;
         // Queue normally — serial queue ensures it runs when MLX is free.
         // No bypass, no retry loop, no fighting for immediate access.
-        const triggerOut = await mlxGenerate(triggerPrompt, { maxTokens: 40960, temperature: 0.2, caller: 'auto-trigger', priority: 0 });
+        // W1-REVERT P0 (2026-04-27): max_tokens=40960 is the AIOS standing directive
+        // for quality preservation (lesson-learned id=229441/229438; user directive
+        // 2026-04-23: "local LLM なので compute 気にしない、品質優先、省略しない").
+        // Under N=1 sequential (_MLX_QUEUE_MAX=6), peak demand = 1 × 40960 — within budget.
+        // W1 attempted to reduce to 600; reverted as 3rd violation of standing directive.
+        const triggerOut = await mlxGenerate(triggerPrompt, { maxTokens: parseInt(process.env.VCTX_MAXTOKENS_AUTO_TRIGGER || '40960', 10), temperature: 0.2, caller: 'auto-trigger', priority: 0 });
         if (triggerOut && triggerOut.length > 5) {
           const lines = triggerOut.trim().split('\n').filter(l => l.includes('|'));
           for (const line of lines.slice(0, 5)) {
@@ -5034,7 +5145,12 @@ Consider: what skills would help agents work more autonomously?
 Do NOT suggest skills similar to never-used ones (they were not useful).
 Output ONLY the suggestion in 2-3 sentences. Be specific.`;
 
-    const suggestion = await mlxGenerate(prompt, { maxTokens: 40960, temperature: 0.5, caller: 'skill-suggestion', priority: 0 });
+    // W1-REVERT P0 (2026-04-27): max_tokens=40960 is the AIOS standing directive
+    // for quality preservation (lesson-learned id=229441/229438; user directive
+    // 2026-04-23: "local LLM なので compute 気にしない、品質優先、省略しない").
+    // Under N=1 sequential (_MLX_QUEUE_MAX=6), peak demand = 1 × 40960 — within budget.
+    // W1 attempted to reduce to 600; reverted as 3rd violation of standing directive.
+    const suggestion = await mlxGenerate(prompt, { maxTokens: parseInt(process.env.VCTX_MAXTOKENS_SKILL_SUGGESTION || '40960', 10), temperature: 0.5, caller: 'skill-suggestion', priority: 0 });
     if (suggestion && suggestion.length > 20) {
       const content = JSON.stringify({
         activity: activitySummary,
@@ -5106,7 +5222,12 @@ origin: auto-generated
 
 - First gotcha`;
 
-      const generated = await mlxGenerate(genPrompt, { maxTokens: 40960, temperature: 0.3, caller: 'skill-creation', priority: 0 });
+      // W1-REVERT P0 (2026-04-27): max_tokens=40960 is the AIOS standing directive
+      // for quality preservation (lesson-learned id=229441/229438; user directive
+      // 2026-04-23: "local LLM なので compute 気にしない、品質優先、省略しない").
+      // Under N=1 sequential (_MLX_QUEUE_MAX=6), peak demand = 1 × 40960 — within budget.
+      // W1 attempted to reduce to 600; reverted as 3rd violation of standing directive.
+      const generated = await mlxGenerate(genPrompt, { maxTokens: parseInt(process.env.VCTX_MAXTOKENS_SKILL_CREATION || '40960', 10), temperature: 0.3, caller: 'skill-creation', priority: 0 });
       await new Promise(r => setTimeout(r, 30000));
       if (!generated || generated.length < 50) continue;
 
@@ -5283,16 +5404,70 @@ function handleWsUpgrade(req, socket) {
   const key = req.headers['sec-websocket-key'];
   if (!key) { socket.destroy(); return; }
 
-  // Auth: check API key from query params or headers
+  // W7 P1: WebSocket auth — prefer headers over query-string (Security HIGH #6)
+  // Token sources, in priority order:
+  //   1. Authorization: Bearer <token>          (preferred)
+  //   2. Sec-WebSocket-Protocol: aios.<token>   (browser-friendly)
+  //   3. X-AIOS-Local-Token: <token>            (consistent with W5)
+  //   4. ?key=<token>                            (DEPRECATED — leaks to logs)
   const url = new URL(req.url, `http://localhost:${PORT}`);
-  const apiKey = url.searchParams.get('key') || '';
+  let apiKey = '';
+  let authSource = 'none';
+  let wsProtoEcho = '';
+
+  // 1. Authorization: Bearer <token>
+  const authHeader = req.headers['authorization'] || '';
+  if (authHeader.startsWith('Bearer ')) {
+    apiKey = authHeader.slice(7);
+    authSource = 'bearer-header';
+  }
+
+  // 2. Sec-WebSocket-Protocol — strip optional `aios.` prefix
+  if (!apiKey) {
+    const wsProto = req.headers['sec-websocket-protocol'] || '';
+    if (wsProto) {
+      // browsers may send "aios.<token>" or just the raw token
+      const candidate = wsProto.split(',').map(s => s.trim()).find(s => s.startsWith('aios.') || /^vctx_/.test(s) || s.length >= 32);
+      if (candidate) {
+        apiKey = candidate.startsWith('aios.') ? candidate.slice(5) : candidate;
+        authSource = 'ws-protocol';
+        wsProtoEcho = candidate;  // RFC 6455: echo back the chosen subprotocol
+      }
+    }
+  }
+
+  // 3. X-AIOS-Local-Token (consistent with W5)
+  let localTokenAuth = false;
+  if (!apiKey) {
+    const localTok = req.headers['x-aios-local-token'] || '';
+    if (localTok && typeof LOCAL_TOKEN !== 'undefined' && LOCAL_TOKEN && localTok === LOCAL_TOKEN) {
+      apiKey = localTok;
+      authSource = 'local-token';
+      localTokenAuth = true;
+    }
+  }
+
+  // 4. Backwards-compat: ?key=<tok> in URL — DEPRECATED, log warning
+  if (!apiKey) {
+    const fromQuery = url.searchParams.get('key') || '';
+    if (fromQuery) {
+      apiKey = fromQuery;
+      authSource = 'query-string-DEPRECATED';
+      console.warn('[ws-auth] Token via ?key= query string is DEPRECATED — leaks to logs. Use Authorization: Bearer <tok> or Sec-WebSocket-Protocol header.');
+    }
+  }
+
   let auth;
-  if (apiKey) {
+  if (localTokenAuth) {
+    // Local-token path: presents owner role (matches validateApiKey W5 behavior)
+    auth = { userId: LOCAL_USER_ID, role: 'owner', groups: ['*'] };
+  } else if (apiKey) {
     const keys = loadApiKeys();
     const entry = keys.keys[apiKey];
     if (!entry) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
     auth = { userId: entry.userId, role: entry.role || 'member', groups: entry.groups || [] };
   } else {
+    // No token of any kind on loopback — preserve historical behavior (owner)
     auth = { userId: LOCAL_USER_ID, role: 'owner', groups: ['*'] };
   }
 
@@ -5301,13 +5476,19 @@ function handleWsUpgrade(req, socket) {
     .update(key + WS_MAGIC)
     .digest('base64');
 
-  socket.write(
+  // W7 P1: RFC 6455 — if client sent Sec-WebSocket-Protocol and we matched it,
+  // echo back the chosen subprotocol header. Hand-rolled handshake (no ws lib),
+  // so we just append the header line before the terminator.
+  let handshake =
     'HTTP/1.1 101 Switching Protocols\r\n' +
     'Upgrade: websocket\r\n' +
     'Connection: Upgrade\r\n' +
-    `Sec-WebSocket-Accept: ${acceptKey}\r\n` +
-    '\r\n'
-  );
+    `Sec-WebSocket-Accept: ${acceptKey}\r\n`;
+  if (authSource === 'ws-protocol' && wsProtoEcho) {
+    handshake += `Sec-WebSocket-Protocol: ${wsProtoEcho}\r\n`;
+  }
+  handshake += '\r\n';
+  socket.write(handshake);
 
   const clientId = ++wsIdCounter;
   const client = {
@@ -5517,7 +5698,23 @@ function vecUpsert(id, embedding) {
   if (!vecDb || !embedding || embedding.length !== EMBED_DIM) return;
   try {
     const embJson = JSON.stringify(embedding).replace(/'/g, "''");
-    vecDb.exec(`INSERT OR REPLACE INTO vec_entries(rowid, embedding) VALUES (${Number(id)}, vec_f32('${embJson}'))`);
+    // 2026-04-24 vec0 UNIQUE-violation fix: sqlite-vec's vec0 virtual
+    // table does NOT fully honor INSERT OR REPLACE — a duplicate rowid
+    // fires UNIQUE constraint error instead of replacing. Use explicit
+    // DELETE-then-INSERT inside a transaction so update semantics work
+    // correctly (DELETE of non-existent rowid is a no-op, so the
+    // first-insert case is handled too). ROLLBACK on partial failure
+    // preserves prior state (the pre-fix code risked losing a row's
+    // embedding when OR REPLACE erroneously threw mid-write).
+    vecDb.exec('BEGIN IMMEDIATE');
+    try {
+      vecDb.exec(`DELETE FROM vec_entries WHERE rowid = ${Number(id)}`);
+      vecDb.exec(`INSERT INTO vec_entries(rowid, embedding) VALUES (${Number(id)}, vec_f32('${embJson}'))`);
+      vecDb.exec('COMMIT');
+    } catch (inner) {
+      try { vecDb.exec('ROLLBACK'); } catch {}
+      throw inner;
+    }
   } catch (e) {
     // 2026-04-23 silent-catch fix (Tier C, top-2 from
     // docs/analysis/2026-04-22-silent-catches-structuring.md §4 Q3).
@@ -5731,12 +5928,30 @@ function safeSliceCodePoints(s, n) {
 }
 
 // Mutex for MLX embed — prevents GPU contention between embed loop and inline store
-let _mlxEmbedLock = Promise.resolve();
-function withMlxLock(fn) {
-  const prev = _mlxEmbedLock;
-  let release;
-  _mlxEmbedLock = new Promise(r => { release = r; });
-  return prev.then(() => fn().finally(release));
+// W1 P0: replaced chain-based withMlxLock with semaphore + timeout (2026-04-27)
+class Sem {
+  constructor(n) { this._n = n; this._waiters = []; }
+  async acquire(timeoutMs) {
+    if (this._n > 0) { this._n--; return () => this._release(); }
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => {
+        const i = this._waiters.indexOf(entry); if (i >= 0) this._waiters.splice(i, 1);
+        reject(new Error('mlx lock timeout (' + timeoutMs + 'ms)'));
+      }, timeoutMs);
+      const entry = { resolve, t };
+      this._waiters.push(entry);
+    });
+  }
+  _release() {
+    this._n++;
+    const next = this._waiters.shift();
+    if (next) { clearTimeout(next.t); this._n--; next.resolve(() => this._release()); }
+  }
+}
+const _mlxSem = new Sem(1);
+async function withMlxLock(fn, { timeoutMs = 300_000 } = {}) {
+  const release = await _mlxSem.acquire(timeoutMs);
+  try { return await fn(); } finally { release(); }
 }
 
 // ── MLX keep-alive probe (2026-04-21) ──────────────────────────
@@ -6034,10 +6249,15 @@ function _mlxGenerateRaw(prompt, options = {}) {
     // vllm-mlx is 2.5x faster — allow higher tokens (Qwen3 thinking uses ~200)
     // and block embed loop. Qwen3 thinking mode uses ~200 tokens for think,
     // leaving ~300 for actual content. Sufficient for summarization tasks.
+    // γ1 fix 2026-04-27: fallback aligned with standing directive id=229441/229438
+    // (lesson-learned 'maxTokens=40960 は品質保持の意図的設計', user directive
+    // 2026-04-23 'local LLM なので compute 気にしない、品質優先、省略しない').
+    // Was: 4000 → 40960. Most callers pass maxTokens explicitly; this fallback
+    // catches the rare omission and applies the directive default.
     const body = JSON.stringify({
       model: MLX_GENERATE_MODEL,
       messages: [{ role: 'user', content: effectivePrompt }],
-      max_tokens: options.maxTokens || 4000,
+      max_tokens: options.maxTokens || 40960,
       temperature: options.temperature ?? 0.3,
       ...(options.seed != null ? { seed: options.seed } : {}),
     });
@@ -6079,6 +6299,8 @@ function _mlxGenerateRaw(prompt, options = {}) {
 // Priority queue for MLX generate. Skills = high, everything else = normal.
 // High-priority items jump ahead in the queue so skills are usable ASAP.
 const MLX_PRIORITY = { high: 0, normal: 1, low: 2 };
+// W1 P0: bound queue to prevent memory pressure under MLX outage (2026-04-27)
+const _MLX_QUEUE_MAX = parseInt(process.env.VCTX_MLX_QUEUE_MAX || '6', 10);
 const _mlxQueue = [];      // { resolve, reject, fn, priority }
 let _mlxRunning = false;
 
@@ -6144,12 +6366,29 @@ async function _mlxDrain() {
 }
 
 async function mlxGenerate(prompt, options = {}) {
+  // Y-SYNC re-apply of W11' P0 (mlxBudget integration, AC-B2) — acquire
+  // per-minute token budget BEFORE queueing. If budget would be exceeded,
+  // reject immediately with code='BUDGET_EXCEEDED' (no silent enqueue).
+  const kind = options.caller || 'unknown';
+  const tokens = options.maxTokens || 40960;
+  let release;
+  try {
+    release = await mlxBudget.acquire(kind, tokens);
+  } catch (e) {
+    if (e.code === 'BUDGET_EXCEEDED') return Promise.reject(e);
+    throw e;
+  }
   const priority = options.priority ?? MLX_PRIORITY.normal;
   return new Promise((resolve, reject) => {
+    // W1 P0: bound queue to prevent memory pressure under MLX outage (2026-04-27)
+    if (_mlxQueue.length >= _MLX_QUEUE_MAX) {
+      release();
+      return reject(new Error('mlx queue full (max=' + _MLX_QUEUE_MAX + ')'));
+    }
     _mlxQueue.push({
       priority,
-      resolve,
-      reject,
+      resolve: (v) => { release(); resolve(v); },
+      reject: (e) => { release(); reject(e); },
       fn: async () => {
         const delays = [30000, 60000, 120000];
         let lastErr;
@@ -6256,6 +6495,12 @@ function handleAiStatus(req, res) {
       single: _mlxLatencyStats('single'),
       batch: _mlxLatencyStats('batch'),
     },
+    // W1 P0: bound queue to prevent memory pressure under MLX outage (2026-04-27)
+    mlx_queue_depth: _mlxQueue.length,
+    mlx_queue_max: _MLX_QUEUE_MAX,
+    // Y-SYNC re-apply of W11' P0 (mlxBudget integration, AC-B2) — surface
+    // per-minute MLX token budget consumption for /ai/status observers.
+    mlx_budget: mlxBudget.status(),
   });
 }
 
@@ -6272,7 +6517,7 @@ async function handleAiSummarize(req, res) {
     const rows = dbQuery(`SELECT id, content FROM entries WHERE reasoning IS NULL AND created_at < datetime('now', '-1 day') LIMIT 20;`);
     for (const row of rows) {
       try {
-        const summary = await mlxGenerate(`Summarize in one sentence (max 50 words):\n\n${row.content.slice(0, 2000)}`, { maxTokens: 400, noThink: true });
+        const summary = await mlxGenerate(`Summarize in one sentence (max 50 words):\n\n${row.content.slice(0, 2000)}`, { maxTokens: 400, noThink: true, caller: 'summarize' });
         if (summary) dbExec(`UPDATE entries SET reasoning = ${esc(summary.trim())} WHERE id = ${row.id};`);
       } catch {}
     }
@@ -6285,7 +6530,7 @@ async function handleAiSummarize(req, res) {
     const rows = dbQuery(`SELECT content FROM entries WHERE id = ${id};`);
     if (rows[0]) {
       try {
-        const summary = await mlxGenerate(`Summarize in one sentence (max 50 words):\n\n${rows[0].content.slice(0, 2000)}`, { maxTokens: 400, noThink: true });
+        const summary = await mlxGenerate(`Summarize in one sentence (max 50 words):\n\n${rows[0].content.slice(0, 2000)}`, { maxTokens: 400, noThink: true, caller: 'summarize' });
         if (summary) { dbExec(`UPDATE entries SET reasoning = ${esc(summary.trim())} WHERE id = ${id};`); count++; }
       } catch {}
     }
@@ -6706,7 +6951,12 @@ ${latestPractices ? `Latest best practices from web (2026):\n${latestPractices}\
 List ONLY the violations found (omissions). If none, say "NONE".
 Be specific about what was missed.`;
 
-      const violations = await mlxGenerate(checkPrompt, { maxTokens: 40960, temperature: 0.2 });
+      // W1-REVERT P0 (2026-04-27): max_tokens=40960 is the AIOS standing directive
+      // for quality preservation (lesson-learned id=229441/229438; user directive
+      // 2026-04-23: "local LLM なので compute 気にしない、品質優先、省略しない").
+      // Under N=1 sequential (_MLX_QUEUE_MAX=6), peak demand = 1 × 40960 — within budget.
+      // W1 attempted to reduce to 1000; reverted as 3rd violation of standing directive.
+      const violations = await mlxGenerate(checkPrompt, { maxTokens: parseInt(process.env.VCTX_MAXTOKENS_COMPLETION_CHECK || '40960', 10), temperature: 0.2, caller: 'completion-check' });
       if (!violations || violations.trim() === 'NONE' || violations.length < 10) {
         console.log('[vcontext:check] Completion check passed');
         return;
@@ -6725,7 +6975,12 @@ Be specific about what was missed.`;
       const rulePrompt = `Based on this violation, write a short MANDATORY RULE (1-2 sentences) to prevent it from happening again. Output ONLY the rule text.
 
 Violation: ${violations.trim().slice(0, 300)}`;
-      const newRule = await mlxGenerate(rulePrompt, { maxTokens: 40960, temperature: 0.2 });
+      // W1-REVERT P0 (2026-04-27): max_tokens=40960 is the AIOS standing directive
+      // for quality preservation (lesson-learned id=229441/229438; user directive
+      // 2026-04-23: "local LLM なので compute 気にしない、品質優先、省略しない").
+      // Under N=1 sequential (_MLX_QUEUE_MAX=6), peak demand = 1 × 40960 — within budget.
+      // W1 attempted to reduce to 1000; reverted as 3rd violation of standing directive.
+      const newRule = await mlxGenerate(rulePrompt, { maxTokens: parseInt(process.env.VCTX_MAXTOKENS_RULE_GEN || '40960', 10), temperature: 0.2, caller: 'rule-gen' });
       if (newRule && newRule.length > 20) {
         // Check if a similar rule already exists
         const existing = dbQuery(`SELECT id FROM entries WHERE type = 'decision' AND content LIKE ${esc('%' + newRule.trim().slice(0, 30) + '%')} AND tags LIKE '%global-rule%' LIMIT 1;`);
@@ -6931,7 +7186,7 @@ Keywords:`;
       // to the user's prompt words so the pipeline keeps moving.
       let keywordsRaw = '';
       try {
-        keywordsRaw = await mlxGenerate(keywordPrompt, { maxTokens: 2000, temperature: 0.1, noThink: true });
+        keywordsRaw = await mlxGenerate(keywordPrompt, { maxTokens: 2000, temperature: 0.1, noThink: true, caller: 'predict' });
       } catch (e) {
         console.error(`[vcontext:predict] mlxGenerate failed: ${e.message}`);
       }
@@ -7006,7 +7261,12 @@ Keywords:`;
       try {
         const bgPrompt = `List 3 key technical facts or best practices about: ${sanitized}
 Output as a numbered list. Be specific and actionable. Max 100 words.`;
-        const bgKnowledge = await mlxGenerate(bgPrompt, { maxTokens: 40960, temperature: 0.3 });
+        // W1-REVERT P0 (2026-04-27): max_tokens=40960 is the AIOS standing directive
+        // for quality preservation (lesson-learned id=229441/229438; user directive
+        // 2026-04-23: "local LLM なので compute 気にしない、品質優先、省略しない").
+        // Under N=1 sequential (_MLX_QUEUE_MAX=6), peak demand = 1 × 40960 — within budget.
+        // W1 attempted to reduce to 1000; reverted as 3rd violation of standing directive.
+        const bgKnowledge = await mlxGenerate(bgPrompt, { maxTokens: parseInt(process.env.VCTX_MAXTOKENS_PREDICT_BG || '40960', 10), temperature: 0.3, caller: 'predict-bg' });
         if (bgKnowledge && bgKnowledge.length > 20) {
           parts.push(`[knowledge] ${bgKnowledge.trim()}`);
         }
@@ -7442,6 +7702,17 @@ const server = createServer(async (req, res) => {
     } else if (method === 'POST' && path === '/admin/vote') {
       // Consensus: same prompt, N samples (different seeds), majority wins.
       // Body: { prompt, samples?: 3 }
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4) — calls
+      // mlxGenerate N times so an unauthenticated caller could exhaust
+      // the MLX serial lock and DoS legitimate work.
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       const body = await readBody(req);
       const n = Math.max(2, Math.min(parseInt(body.samples, 10) || 3, 5));
       const responses = [];
@@ -7467,6 +7738,12 @@ const server = createServer(async (req, res) => {
       // Each role asks different questions against the same live system
       // so no single blind spot hides a bug. Part of the AI OS's checker
       // discipline (not just a memory rule).
+      // W5 P1: capture auth so we can gate the `security` section below
+      // (Security LOW — leaks secret-pattern hit-counts as recon if the
+      // server is LAN-bound). Non-admin callers see the rest of the
+      // checks but the security block is redacted.
+      const _mrcAuth = validateApiKey(req);
+      const _mrcCanSeeSecurity = _mrcAuth.valid && hasRole(_mrcAuth, 'admin');
       const out = { roles: {}, findings: [], checked_at: new Date().toISOString() };
       const ramCount = (q) => { try { return ramDb.prepare(q).get(); } catch { return null; } };
       const ssdCount = (q) => { try { return ssdDb.prepare(q).get(); } catch { return null; } };
@@ -7499,20 +7776,28 @@ const server = createServer(async (req, res) => {
 
       // 4. Security — secret patterns with WORD BOUNDARIES to avoid
       // matching path fragments like 'serene-keller' for 'sk-'.
-      const sec = {
-        api_key_perm: (() => { try { return require('node:fs').statSync(join(BACKUP_DIR, 'vcontext-api-keys.json')).mode & 0o777; } catch { return null; } })(),
-        bind_host: process.env.VCONTEXT_BIND || '127.0.0.1',
-        // GLOB with explicit prefix boundaries
-        secret_pattern_hits: ramCount(`SELECT COUNT(*) c FROM entries WHERE created_at > datetime('now','-1 hour') AND (
-          content GLOB '*[^a-zA-Z0-9-]sk-[A-Za-z0-9]*' OR
-          content GLOB '*[^a-zA-Z0-9-]ghp_[A-Za-z0-9]*' OR
-          content GLOB '*[^a-zA-Z0-9-]AKIA[A-Z0-9]*' OR
-          content GLOB '*Bearer eyJ*'
-        )`)?.c || 0,
-      };
-      if (sec.api_key_perm && sec.api_key_perm !== 0o600) out.findings.push({ role: 'security', msg: `api-key file perm ${sec.api_key_perm.toString(8)} (expected 600)` });
-      if (sec.secret_pattern_hits > 0) out.findings.push({ role: 'security', msg: `${sec.secret_pattern_hits} entries with known-secret patterns` });
-      out.roles.security = sec;
+      // W5 P1: gated behind admin role (Security LOW). Non-admin
+      // callers receive a redacted block — the secret-pattern hit
+      // counts on a LAN-exposed instance are useful recon for an
+      // attacker who's already enumerating the API surface.
+      if (_mrcCanSeeSecurity) {
+        const sec = {
+          api_key_perm: (() => { try { return require('node:fs').statSync(join(BACKUP_DIR, 'vcontext-api-keys.json')).mode & 0o777; } catch { return null; } })(),
+          bind_host: process.env.VCONTEXT_BIND || '127.0.0.1',
+          // GLOB with explicit prefix boundaries
+          secret_pattern_hits: ramCount(`SELECT COUNT(*) c FROM entries WHERE created_at > datetime('now','-1 hour') AND (
+            content GLOB '*[^a-zA-Z0-9-]sk-[A-Za-z0-9]*' OR
+            content GLOB '*[^a-zA-Z0-9-]ghp_[A-Za-z0-9]*' OR
+            content GLOB '*[^a-zA-Z0-9-]AKIA[A-Z0-9]*' OR
+            content GLOB '*Bearer eyJ*'
+          )`)?.c || 0,
+        };
+        if (sec.api_key_perm && sec.api_key_perm !== 0o600) out.findings.push({ role: 'security', msg: `api-key file perm ${sec.api_key_perm.toString(8)} (expected 600)` });
+        if (sec.secret_pattern_hits > 0) out.findings.push({ role: 'security', msg: `${sec.secret_pattern_hits} entries with known-secret patterns` });
+        out.roles.security = sec;
+      } else {
+        out.roles.security = { redacted: true, reason: 'requires admin role' };
+      }
 
       // 5. Holistic — cross-subsystem consistency
       const ftsMatch = (ramCount(`SELECT COUNT(*) c FROM entries`)?.c || 0) === (ramCount(`SELECT COUNT(*) c FROM entries_fts`)?.c || 0);
@@ -7535,6 +7820,15 @@ const server = createServer(async (req, res) => {
       sendJson(res, 200, out);
     } else if (method === 'POST' && path === '/admin/mlx-test') {
       // Reproducibility / debug endpoint — calls mlxGenerate with a seed.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       const body = await readBody(req);
       try {
         const out = await mlxGenerate(body.prompt || '', { maxTokens: 40960, temperature: 0, seed: body.seed, caller: 'repro' });
@@ -7555,6 +7849,15 @@ const server = createServer(async (req, res) => {
       });
     } else if (method === 'POST' && path === '/admin/wipe-user') {
       // Compliance: delete all entries tagged user:<id>. Returns count.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       const body = await readBody(req);
       const userId = body.userId;
       if (!userId) return sendJson(res, 400, { error: 'userId required' });
@@ -7565,6 +7868,15 @@ const server = createServer(async (req, res) => {
         sendJson(res, 200, { ram_deleted: r.changes, ssd_deleted: ssdR.changes, userId });
       } catch (e) { sendJson(res, 500, { error: e.message }); }
     } else if (method === 'POST' && path === '/admin/verify-backup') {
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       // Stage 4.5 Commit C5 (spec §3.2.x "verify-snapshot", AC-4).
       //
       // Previously this handler ran PRAGMA integrity_check + COUNT(*)
@@ -7671,9 +7983,17 @@ const server = createServer(async (req, res) => {
       } catch (e) { sendJson(res, 500, { error: e.message }); }
     } else if (method === 'POST' && path === '/admin/approve-patch') {
       // Apply patch → test → reload. Auto-rollback on failure.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4) — pre-W5
+      // only the CSRF header was checked; viewer-keys and unauthenticated
+      // local processes could approve arbitrary patches.
       // CSRF defense: require custom header.  Simple cross-origin requests
       // can't set this without CORS preflight, defeating trivial CSRF
       // (a malicious browser page curl-bombing localhost:3150).
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
       }
@@ -7739,6 +8059,12 @@ const server = createServer(async (req, res) => {
         sendJson(res, 200, { applied: true, patchId });
       } catch (e) { sendJson(res, 500, { error: e.message }); }
     } else if (method === 'POST' && path === '/admin/reject-patch') {
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required' });
       }
@@ -7759,6 +8085,12 @@ const server = createServer(async (req, res) => {
       // accepted without losing the original evaluation context.
       // Does NOT apply code changes — adoption just records intent;
       // humans still schedule the actual implementation.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required' });
       }
@@ -7781,6 +8113,12 @@ const server = createServer(async (req, res) => {
     } else if (method === 'POST' && path === '/admin/reject-idea') {
       // Symmetric to /admin/reject-patch but for pending-idea entries.
       // Dashboard "Today's Ideas" Dismiss button calls this.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required' });
       }
@@ -7799,6 +8137,12 @@ const server = createServer(async (req, res) => {
       // Use after catastrophic DB loss if both RAM and SSD SQLite are gone
       // but the JSONL log survived. Non-destructive — duplicates are skipped.
       // CSRF-guarded because it does bulk DB writes.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required' });
       }
@@ -7939,6 +8283,12 @@ const server = createServer(async (req, res) => {
       } catch (e) { sendJson(res, 500, { error: e.message }); }
     } else if (method === 'POST' && path === '/admin/rollback-last') {
       // Rollback last self-improve commit (git reset + reload).
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required' });
       }
@@ -7952,6 +8302,12 @@ const server = createServer(async (req, res) => {
       // Soft restart — send SIGHUP to the wrapper, which kills the current
       // server and starts a fresh one (sub-5s downtime). LaunchAgent stays
       // loaded, so a crash at any point still auto-recovers.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required' });
       }
@@ -7979,6 +8335,12 @@ const server = createServer(async (req, res) => {
       //      reboot even though plist was valid).
       // The watchdog self-heal (vcontext-watchdog.sh) honors `disable`
       // state — it will NOT auto-restart us until the user re-enables.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required' });
       }
@@ -8183,6 +8545,18 @@ const server = createServer(async (req, res) => {
       // crashes. Stores a type='task-request' entry; aios-task-runner.js
       // (independent LaunchAgent) polls and dispatches. Result lands back as
       // type='task-result' so the next Claude Code session can /recall it.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4) — pre-W5
+      // shell-command was guarded by header+approved_by_user only; both
+      // were attacker-controllable HTTP fields, so any local process
+      // could RCE. Now caller must additionally hold admin role.
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       try {
         const body = await readBody(req);
         const ALLOWED_TASK_TYPES = new Set([
@@ -8193,26 +8567,22 @@ const server = createServer(async (req, res) => {
           'shell-command',
         ]);
         const task_type = typeof body.task_type === 'string' ? body.task_type : '';
+        // W6 P1: HTTP path NEVER accepts shell-command task type (Security CRITICAL #2)
+        // shell-command is CLI-only; even admin role cannot RCE via HTTP.
+        // Defense-in-depth ON TOP of W5's auth+role+CSRF gating: refusal is
+        // unconditional at the HTTP boundary — there is no header, role, or
+        // payload field that admits shell-command via HTTP. Use scripts/aios-task-cli.js.
+        if (task_type === 'shell-command' || (body && body.task_type === 'shell-command')) {
+          return sendJson(res, 403, {
+            error: 'shell-command task type is not accepted via HTTP. Use CLI: node scripts/aios-task-cli.js shell-command --cmd "..."',
+            refused_at: 'http-boundary',
+            code: 'http_shell_refused'
+          });
+        }
         if (!ALLOWED_TASK_TYPES.has(task_type)) {
           return sendJson(res, 400, { error: `Unknown task_type. Allowed: ${[...ALLOWED_TASK_TYPES].join(', ')}` });
         }
         const payload = (body.payload && typeof body.payload === 'object') ? body.payload : {};
-        // shell-command RCE guard — admin header + explicit user-approval marker.
-        // Defense-in-depth: header (CSRF/DNS-rebind) + approved_by_user (intent).
-        // Non-shell task types (locomo-eval, skill-discovery-adhoc, etc.) are
-        // intentionally exempt from the header check to preserve adhoc dispatch.
-        // See docs/spec/2026-04-18-task-request-admin-header.md.
-        if (task_type === 'shell-command') {
-          if (req.headers['x-vcontext-admin'] !== 'yes') {
-            return sendJson(res, 403, {
-              error: 'shell-command requires X-Vcontext-Admin: yes header',
-              docs: 'docs/policy/autonomous-commit-gate.md §0',
-            });
-          }
-          if (payload.approved_by_user !== true) {
-            return sendJson(res, 403, { error: 'shell-command task requires payload.approved_by_user === true' });
-          }
-        }
         const priority = [1, 2, 3].includes(body.priority) ? body.priority : 2;
         const requested_by = typeof body.requested_by === 'string' ? body.requested_by.slice(0, 120) : 'unknown';
         const request_id = require('node:crypto').randomUUID();
@@ -8333,6 +8703,15 @@ const server = createServer(async (req, res) => {
       // Manually generate an L2 (daily) summary for a given UTC date.
       // Body: {date: "YYYY-MM-DD"}.  Omit date → default to yesterday.
       // Fire-and-forget so a slow MLX gen can't stall the HTTP loop.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       try {
         const body = await readBody(req);
         const dayId = body.date || dayIdFor(Date.now() - 24 * 3600 * 1000);
@@ -8350,6 +8729,15 @@ const server = createServer(async (req, res) => {
     } else if (method === 'POST' && path === '/admin/trigger-l3-summary') {
       // Manually generate an L3 (weekly) summary for a given ISO week.
       // Body: {week: "YYYY-Www"}.  Omit → default to last week.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       try {
         const body = await readBody(req);
         const weekId = body.week || weekIdFor(Date.now() - 7 * 24 * 3600 * 1000);
@@ -8368,6 +8756,15 @@ const server = createServer(async (req, res) => {
       // Manually fire the AI-driven loops whose scheduler has gone quiet.
       // MLX uses a single serialized lock — run tasks SEQUENTIALLY so
       // they don't starve each other with 503 busy responses.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       sendJson(res, 202, { status: 'triggered' });
       setImmediate(async () => {
         const results = {};
@@ -8383,6 +8780,15 @@ const server = createServer(async (req, res) => {
       });
     } else if (method === 'POST' && path === '/admin/fts-rebuild') {
       // Rebuild the FTS5 index (recovers DELETE triggers after corruption).
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       try {
         ramDb.exec(`INSERT INTO entries_fts(entries_fts) VALUES('rebuild')`);
         sendJson(res, 200, { status: 'rebuilt' });
@@ -8407,6 +8813,12 @@ const server = createServer(async (req, res) => {
       //
       // Rate-limit: 1/60s. backup.sh LaunchAgent fires every 15 min
       // anyway; the rate-limit stops accidental hammering.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, {
           error: 'X-Vcontext-Admin: yes header required for admin operations',
@@ -8450,8 +8862,18 @@ const server = createServer(async (req, res) => {
         // path), any future refactor. Reviewer 2026-04-20 caught 3
         // missing reset paths in the pre-finally shape; finally is the
         // only robust option.
+        //
+        // 2026-04-24 L2 palliative: handler-side timeout. The work runs as
+        // a detached promise so we can race it against a 240s timer. If
+        // the timer wins, we respond {status:fail,reason:timeout} but
+        // DO NOT clear _backupInFlight — the real backup is still copying
+        // pages; clearing early would let a second caller start a
+        // concurrent ramDb.backup() (the exact corruption the in-flight
+        // guard prevents). The flag clears via work.finally() whenever
+        // the backup actually settles. Future callers during that window
+        // correctly see status:busy via the existing guard at L8426.
         globalThis._backupInFlight = true;
-        try {
+        const work = (async () => {
           const startT = Date.now();
           const tmpPath = BACKUP_PATH + '.tmp';
           cleanupBackupTmp(tmpPath);
@@ -8464,17 +8886,17 @@ const server = createServer(async (req, res) => {
             await ramDb.backup(tmpPath);
           } catch (e) {
             cleanupBackupTmp(tmpPath);
-            return sendJson(res, 500, { status: 'fail', reason: 'backup_failed', detail: e.message });
+            return { code: 500, body: { status: 'fail', reason: 'backup_failed', detail: e.message } };
           }
 
           // Verify integrity of the tmp before promoting.
           if (!verifyBackupFile(tmpPath)) {
             emitBackupIntegrityAlert(tmpPath, 'admin-backup: integrity_check failed on freshly-written tmp');
             cleanupBackupTmp(tmpPath);
-            return sendJson(res, 500, {
+            return { code: 500, body: {
               status: 'fail', reason: 'integrity_fail_on_tmp',
               hint: '.bak preserved, .sqlite untouched',
-            });
+            } };
           }
 
           // Truncate WAL on the verified tmp so rename moves a single self-contained file.
@@ -8532,10 +8954,30 @@ const server = createServer(async (req, res) => {
             );
           } catch { /* non-fatal */ }
 
-          sendJson(res, 200, result);
-        } finally {
-          globalThis._backupInFlight = false;
+          return { code: 200, body: result };
+        })();
+        // Clear in-flight flag only when the real work settles (win or timeout).
+        work.catch(() => {}).finally(() => { globalThis._backupInFlight = false; });
+
+        const HANDLER_TIMEOUT_MS = 240 * 1000;
+        let timerHandle;
+        const timeoutSentinel = Symbol('backup-handler-timeout');
+        const timer = new Promise(resolve => {
+          timerHandle = setTimeout(() => resolve(timeoutSentinel), HANDLER_TIMEOUT_MS);
+        });
+        const raced = await Promise.race([work, timer]);
+        if (raced === timeoutSentinel) {
+          // Work still running — leave _backupInFlight set; future callers get status:busy.
+          console.warn(`[admin:backup] handler timeout after ${HANDLER_TIMEOUT_MS}ms; work continues in background`);
+          return sendJson(res, 504, {
+            status: 'fail',
+            reason: 'timeout',
+            timeout_ms: HANDLER_TIMEOUT_MS,
+            hint: 'backup still running in background; retries will see status:busy until it settles',
+          });
         }
+        clearTimeout(timerHandle);
+        sendJson(res, raced.code, raced.body);
       } catch (e) {
         sendJson(res, 500, { status: 'fail', error: e.message });
       }
@@ -8561,6 +9003,12 @@ const server = createServer(async (req, res) => {
       // No rate-limit: checkpoint is cheap (ms-scale on a clean WAL,
       // low-seconds on a multi-GB runaway WAL). Callers can invoke as
       // often as they like.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, {
           error: 'X-Vcontext-Admin: yes header required for admin operations',
@@ -8645,6 +9093,12 @@ const server = createServer(async (req, res) => {
       // (but NOT the size gate unless the env var is also set).
       //
       // Rollback: VCTX_VACUUM_DISABLED=1 → unconditional 503.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, {
           error: 'X-Vcontext-Admin: yes header required for admin operations',
@@ -8786,6 +9240,12 @@ const server = createServer(async (req, res) => {
       //
       // Rate-limit: 1/hour via admin-auto-tune-run entries.
       // force=true in body bypasses rate gate (for manual reruns).
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, {
           error: 'X-Vcontext-Admin: yes header required for admin operations',
@@ -8904,6 +9364,12 @@ const server = createServer(async (req, res) => {
       // Rate-limit: 1 per 10 min per label (force bypasses).
       // In-flight guard: prevents parallel snapshot() calls (each copies
       // the full 6.7 GB DB — two at once saturates IO for minutes).
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, {
           error: 'X-Vcontext-Admin: yes header required for admin operations',
@@ -9206,6 +9672,15 @@ const server = createServer(async (req, res) => {
     } else if (method === 'POST' && path === '/admin/dedup-ssd') {
       // Focused SSD dedup. Creates index first to avoid O(n²) scan,
       // then uses MIN(id) GROUP BY (O(n log n)).
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       const result = { deleted: 0, schema_fixed: 0, vacuumed: false, indexed: false, error: null };
       try {
         try {
@@ -9240,6 +9715,15 @@ const server = createServer(async (req, res) => {
       // rows, delete duplicate entries (keep oldest id per group), then
       // add a UNIQUE index so future writes are atomically deduped.
       // Skip types where repetition is legitimate.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       const SKIP = ['test', 'working-state', 'session-recall', 'anomaly-alert'];
       const skipSql = SKIP.map(t => `'${t}'`).join(',');
       const crypto = require('node:crypto');
@@ -9437,6 +9921,12 @@ const server = createServer(async (req, res) => {
       //
       // Body: { embedding_prune_days?: N (default 30),
       //         include_types?: [type,...] (default all candidate types) }
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, {
           error: 'X-Vcontext-Admin: yes header required for admin operations',
@@ -9504,6 +9994,12 @@ const server = createServer(async (req, res) => {
       //   - any finding with severity='high' → 'fail'
       //   - any finding with severity='warn' → 'warn'
       //   - otherwise → 'pass'
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+      }
       if (req.headers['x-vcontext-admin'] !== 'yes') {
         return sendJson(res, 403, {
           error: 'X-Vcontext-Admin: yes header required for admin operations',
@@ -10078,6 +10574,15 @@ const server = createServer(async (req, res) => {
       // Nuclear rebuild: drop FTS + triggers, recreate, reindex from entries,
       // then hard-delete all status='migrated' rows. Done in a single
       // transaction on the live DB (no server restart needed).
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       const result = { dropped: false, recreated: false, reindexed: 0, cleaned: 0, error: null };
       try {
         const tx = ramDb.transaction(() => {
@@ -10123,6 +10628,15 @@ const server = createServer(async (req, res) => {
     } else if (method === 'POST' && path === '/admin/fts-hard-cleanup') {
       // After a successful FTS rebuild, attempt hard-delete of soft-
       // migrated rows. Returns counts.
+      // W5 P1: stack auth + role + CSRF (Security HIGH #4, F4)
+      {
+        const auth = validateApiKey(req);
+        if (!auth.valid) return sendJson(res, 401, { error: 'invalid token' });
+        if (!hasRole(auth, 'admin')) return sendJson(res, 403, { error: 'admin role required' });
+        if (req.headers['x-vcontext-admin'] !== 'yes') {
+          return sendJson(res, 403, { error: 'X-Vcontext-Admin: yes header required for destructive admin actions' });
+        }
+      }
       let deleted = 0, failed = 0;
       try {
         const rows = ramDb.prepare(`SELECT id FROM entries WHERE status='migrated'`).all();
@@ -10476,6 +10990,35 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
+// 2026-04-24 heap-snapshot diagnostic hook (β). SIGUSR2 → V8 heap snapshot
+// to /tmp/vcontext-heap-<ts>.heapsnapshot. Use:
+//   kill -USR2 $(pgrep -f 'vcontext-server.js' | head -1)
+// The watchdog tick (below) ALSO auto-fires SIGUSR2 when heap >= 600MB.
+// Rate-limited to 1 dump / 60s to prevent disk fill if a spike is sustained.
+// Analyzing: Chrome DevTools → Memory tab → Load the .heapsnapshot file.
+let _lastHeapDumpAt = 0;
+const _HEAP_DUMP_MIN_INTERVAL_MS = 60 * 1000;
+process.on('SIGUSR2', () => {
+  const now = Date.now();
+  if (now - _lastHeapDumpAt < _HEAP_DUMP_MIN_INTERVAL_MS) {
+    const ago = Math.round((now - _lastHeapDumpAt) / 1000);
+    console.log(`[heap-dump] SIGUSR2: throttled (last dump ${ago}s ago, min=${_HEAP_DUMP_MIN_INTERVAL_MS/1000}s)`);
+    return;
+  }
+  _lastHeapDumpAt = now;
+  try {
+    const v8 = require('node:v8');
+    const p = `/tmp/vcontext-heap-${now}.heapsnapshot`;
+    const t0 = Date.now();
+    v8.writeHeapSnapshot(p);
+    const el = ((Date.now() - t0) / 1000).toFixed(1);
+    const heapMB = Math.round(process.memoryUsage().heapUsed / 1048576);
+    console.log(`[heap-dump] SIGUSR2: wrote ${p} (heap=${heapMB}MB) in ${el}s`);
+  } catch (e) {
+    console.error(`[heap-dump] SIGUSR2 failed: ${(e?.message || e).toString().slice(0, 200)}`);
+  }
+});
+
 // Process-level safety nets — today's audit showed no unhandledRejection
 // handler, which correlates with several exit-137 crashes via async errors
 // escaping setImmediate(async...) callbacks (auto-summarize, auto-embed,
@@ -10531,6 +11074,9 @@ initOtel().then(enabled => {
 
 server.listen(PORT, BIND_HOST, () => {
   console.log(`[vcontext] Virtual Context server running at http://${BIND_HOST}:${PORT}`);
+  // Y-SYNC re-apply of W11' P0 (mlxBudget integration, AC-B2) — surface
+  // OS-layer policy values + source path so operators see the active config.
+  console.log(`[policy] mlx.max_concurrency=${aiosPolicy.get('mlx.max_concurrency')} max_tokens_default=${aiosPolicy.get('mlx.max_tokens_default')} queue_max=${aiosPolicy.get('mlx.queue_max')} loaded from ${aiosPolicy._path}`);
   console.log(`[vcontext] Tier 1 (RAM):   ${DB_PATH}`);
   console.log(`[vcontext] Tier 2 (SSD):   ${SSD_DB_PATH}`);
   console.log(`[vcontext] Tier 3 (Cloud): ${cloudStore.isConfigured() ? 'configured' : 'not configured'}`);
@@ -10579,6 +11125,15 @@ const watchdogTimer = setInterval(() => {
       }
     } catch {}
     console.log(`[watchdog] rss=${rss}MB heap=${heapUsed}/${heapTotal}MB ext=${ext}MB sys_free=${sysFree}MB ${swapStr}`);
+    // 2026-04-24 auto heap-dump (β): if heapUsed >= threshold, fire
+    // SIGUSR2 on self to capture the spike before possible OOM. The
+    // SIGUSR2 handler has its own 60s rate-limit so signaling every
+    // 15s watchdog tick during a sustained spike is safe (most are
+    // throttled). Threshold 600MB chosen after 2026-04-24 12:50 incident
+    // (observed peak 798MB, baseline 46MB — 600MB catches the climb).
+    if (heapUsed >= 600) {
+      try { process.kill(process.pid, 'SIGUSR2'); } catch {}
+    }
   } catch (e) {
     console.error('[watchdog] failed:', e.message);
   }
